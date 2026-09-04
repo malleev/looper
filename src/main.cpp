@@ -10,6 +10,8 @@
 #include <csignal>
 #include <atomic>
 #include <cmath>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 std::atomic<bool> g_running{true};
 
@@ -18,20 +20,21 @@ void signalHandler(int) {
 }
 
 void printStatus(const looper::LooperStatus& status, float loop_gain, float dry_gain) {
-    std::cout << "\r\033[K"; // Clear line
+    // Return cursor to line start and clear line
+    std::cout << "\r\033[2K";
 
-    // State badge
-    std::string state_str = looper::stateToString(status.state);
+    // Compact State Badge (7 chars)
+    std::string state_str = " IDLE ";
     std::string color = "\033[1;37m";
-    if (status.state == looper::LooperState::RECORDING) color = "\033[1;31m"; // Red
-    else if (status.state == looper::LooperState::PLAYING) color = "\033[1;32m"; // Green
-    else if (status.state == looper::LooperState::OVERDUB) color = "\033[1;33m"; // Yellow
-    else if (status.state == looper::LooperState::STOPPED) color = "\033[1;34m"; // Blue
+    if (status.state == looper::LooperState::RECORDING) { state_str = " REC  "; color = "\033[1;31m"; }
+    else if (status.state == looper::LooperState::PLAYING) { state_str = " PLAY "; color = "\033[1;32m"; }
+    else if (status.state == looper::LooperState::OVERDUB) { state_str = " DUB  "; color = "\033[1;33m"; }
+    else if (status.state == looper::LooperState::STOPPED) { state_str = " STOP "; color = "\033[1;34m"; }
 
-    std::cout << color << "[" << std::setw(9) << state_str << "]\033[0m ";
+    std::cout << color << "[" << state_str << "]\033[0m ";
 
-    // Live Input VU-Meter
-    constexpr int METER_WIDTH = 8;
+    // Compact Input Meter (6 chars)
+    constexpr int METER_WIDTH = 4;
     int meter_fill = std::clamp(static_cast<int>(status.in_peak * 10 * METER_WIDTH), 0, METER_WIDTH);
     std::string meter_col = (status.in_peak > 0.8f) ? "\033[1;31m" : "\033[1;32m";
     std::cout << "IN:[" << meter_col;
@@ -41,8 +44,8 @@ void printStatus(const looper::LooperStatus& status, float loop_gain, float dry_
     }
     std::cout << "\033[0m] ";
 
-    // Loop Progress Bar
-    constexpr int BAR_WIDTH = 16;
+    // Compact Progress Bar (10 chars)
+    constexpr int BAR_WIDTH = 8;
     int progress = 0;
     if (status.total_frames > 0) {
         progress = static_cast<int>((static_cast<float>(status.playhead_frames) / status.total_frames) * BAR_WIDTH);
@@ -56,16 +59,20 @@ void printStatus(const looper::LooperStatus& status, float loop_gain, float dry_
     }
     std::cout << "] ";
 
-    // Time
+    // Time: e.g. " 4.8/10.9s " (11 chars)
     std::cout << std::fixed << std::setprecision(1)
-              << status.current_sec << "s / " << status.total_sec << "s | ";
+              << std::setw(4) << status.current_sec << "/" 
+              << std::setw(4) << status.total_sec << "s | ";
 
-    // Flags
-    std::cout << "REV: " << (status.is_reversed ? "\033[1;35mON\033[0m" : "OFF") << " | "
-              << "FADE: " << (status.is_fading_out ? "\033[1;36mON\033[0m" : "OFF") << " | "
-              << "UNDO: " << (status.undo_available ? "\033[1;32mYES\033[0m" : "NO") << " | "
-              << "VOL: " << static_cast<int>(loop_gain * 100) << "% | "
-              << "DRY: " << (dry_gain > 0.05f ? "\033[1;32mON (DirectMon)\033[0m" : "OFF")
+    // Flags: (19 chars)
+    std::cout << "R:" << (status.is_reversed ? "\033[1;35mON \033[0m" : "OFF ")
+              << "F:" << (status.is_fading_out ? "\033[1;36mON \033[0m" : "OFF ")
+              << "U:" << (status.undo_available ? "\033[1;32mYES \033[0m" : "NO  ")
+              << "| ";
+
+    // Volume & Dry: (16 chars)
+    std::cout << "V:" << std::setw(3) << static_cast<int>(loop_gain * 100) << "% "
+              << "DRY:" << (dry_gain > 0.05f ? "\033[1;32mON\033[0m" : "OFF")
               << std::flush;
 }
 
@@ -82,7 +89,7 @@ int main(int argc, char* argv[]) {
     std::cout << "   ORANGE PI GUITAR LOOPER (Version C - Terminal UI) " << std::endl;
     std::cout << "=====================================================" << std::endl;
     std::cout << "Audio device: " << alsa_device << std::endl;
-    std::cout << "\nControls (Works from both SSH and USB keyboard plugged into OPi!):" << std::endl;
+    std::cout << "\nControls (Works from SSH & USB keyboard on OPi!):" << std::endl;
     std::cout << "  [SPACE]     : Rec -> Play -> Overdub -> Play" << std::endl;
     std::cout << "  [S]         : Stop playback" << std::endl;
     std::cout << "  [C]         : Clear loop & reset to IDLE" << std::endl;
@@ -97,7 +104,7 @@ int main(int argc, char* argv[]) {
     looper::LooperConfig config;
     config.sample_rate = 48000;
     config.period_size = 128; // ~2.6 ms buffer
-    config.dry_gain = 1.0f;   // Direct Monitor ON by default so you hear yourself!
+    config.dry_gain = 1.0f;   // Direct Monitor ON by default
     config.loop_gain = 1.0f;
     config.fade_out_sec = 3.0f;
 
