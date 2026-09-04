@@ -30,7 +30,7 @@ void printStatus(const looper::LooperStatus& status, float loop_gain, float dry_
 
     std::cout << color << "[" << std::setw(9) << state_str << "]\033[0m ";
 
-    // Live Input VU-Meter (shows if mic/guitar is receiving sound!)
+    // Live Input VU-Meter
     constexpr int METER_WIDTH = 8;
     int meter_fill = std::clamp(static_cast<int>(status.in_peak * 10 * METER_WIDTH), 0, METER_WIDTH);
     std::string meter_col = (status.in_peak > 0.8f) ? "\033[1;31m" : "\033[1;32m";
@@ -65,7 +65,7 @@ void printStatus(const looper::LooperStatus& status, float loop_gain, float dry_
               << "FADE: " << (status.is_fading_out ? "\033[1;36mON\033[0m" : "OFF") << " | "
               << "UNDO: " << (status.undo_available ? "\033[1;32mYES\033[0m" : "NO") << " | "
               << "VOL: " << static_cast<int>(loop_gain * 100) << "% | "
-              << "DRY: " << (dry_gain > 0.05f ? "\033[1;33mON\033[0m" : "OFF")
+              << "DRY: " << (dry_gain > 0.05f ? "\033[1;32mON (DirectMon)\033[0m" : "OFF")
               << std::flush;
 }
 
@@ -97,7 +97,7 @@ int main(int argc, char* argv[]) {
     looper::LooperConfig config;
     config.sample_rate = 48000;
     config.period_size = 128; // ~2.6 ms buffer
-    config.dry_gain = 0.0f;   // Direct Monitor recommended
+    config.dry_gain = 1.0f;   // Direct Monitor ON by default so you hear yourself!
     config.loop_gain = 1.0f;
     config.fade_out_sec = 3.0f;
 
@@ -114,7 +114,6 @@ int main(int argc, char* argv[]) {
     float current_loop_gain = config.loop_gain;
     float current_dry_gain = config.dry_gain;
 
-    // Initialize InputManager (handles both SSH stdin and physical USB keyboards via evdev)
     looper::InputManager input_manager([&](looper::ActionKey key) {
         switch (key) {
             case looper::ActionKey::ACTION:

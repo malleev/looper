@@ -8,6 +8,7 @@ namespace looper {
 
 constexpr uint32_t DEFAULT_SAMPLE_RATE = 48000;
 constexpr uint32_t DEFAULT_PERIOD_SIZE = 128;   // ~2.6 ms buffer at 48kHz
+constexpr uint32_t DEFAULT_PERIODS = 4;       // 4 periods = 512 frames buffer (~10.6 ms) for rock-solid USB stability
 constexpr uint32_t DEFAULT_CHANNELS = 4;      // MiniFuse 1 requires 4 HW channels
 constexpr uint32_t CROSSFADE_SAMPLES = 240;   // 5 ms crossfade at 48kHz to prevent clicks
 
@@ -33,7 +34,7 @@ inline const char* stateToString(LooperState state) {
 struct LooperConfig {
     uint32_t sample_rate = DEFAULT_SAMPLE_RATE;
     uint32_t period_size = DEFAULT_PERIOD_SIZE;
-    float dry_gain = 0.0f;       // 0.0 if using MiniFuse Direct Monitor hardware button, 1.0 if software monitor
+    float dry_gain = 1.0f;       // 1.0f enabled by default so you hear yourself in real time!
     float loop_gain = 1.0f;      // Main loop playback volume
     float fade_out_sec = 3.0f;   // Fade-out duration in seconds
     uint32_t crossfade_samples = CROSSFADE_SAMPLES;

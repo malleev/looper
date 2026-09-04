@@ -38,7 +38,7 @@ bool AudioDevice::initAlsaDevice(snd_pcm_t** handle, snd_pcm_stream_t stream) {
     snd_pcm_uframes_t period_size = config_.period_size;
     snd_pcm_hw_params_set_period_size_near(*handle, hw_params, &period_size, 0);
 
-    unsigned int periods = 3;
+    unsigned int periods = DEFAULT_PERIODS;
     snd_pcm_hw_params_set_periods_near(*handle, hw_params, &periods, 0);
 
     err = snd_pcm_hw_params(*handle, hw_params);
@@ -54,7 +54,7 @@ bool AudioDevice::initAlsaDevice(snd_pcm_t** handle, snd_pcm_stream_t stream) {
 }
 
 void AudioDevice::handleXrun(snd_pcm_t* handle, snd_pcm_stream_t stream) {
-    int err = snd_pcm_prepare(handle);
+    int err = snd_pcm_recover(handle, -EPIPE, 1);
     if (err < 0) {
         std::cerr << "[ALSA] Recovery failed for " 
                   << (stream == SND_PCM_STREAM_PLAYBACK ? "playback" : "capture") 
@@ -100,7 +100,7 @@ void AudioDevice::stop() {
 }
 
 void AudioDevice::audioLoop() {
-    // Attempt to set real-time priority (SCHED_FIFO)
+    // Set real-time thread priority (SCHED_FIFO)
     struct sched_param param;
     param.sched_priority = 80;
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
@@ -122,8 +122,15 @@ void AudioDevice::audioLoop() {
     constexpr float INT32_TO_FLOAT = 1.0f / 2147483648.0f;
     constexpr float FLOAT_TO_INT32 = 2147483647.0f;
 
+    // CRITICAL: Pre-fill playback buffer with 2 periods of silence!
+    // This creates a pipeline cushion so that when snd_pcm_readi blocks for capture,
+    // playback does not starve and underrun (which causes bitcrusher-like buzzing distortion).
+    std::vector<int32_t> silence(period * channels, 0);
+    snd_pcm_writei(playback_handle_, silence.data(), period);
+    snd_pcm_writei(playback_handle_, silence.data(), period);
+
     while (is_running_.load(std::memory_order_relaxed)) {
-        // Read from ALSA capture
+        // Read from ALSA capture (blocking for 1 period)
         snd_pcm_sframes_t frames_read = snd_pcm_readi(capture_handle_, in_buffer.data(), period);
         if (frames_read < 0) {
             if (frames_read == -EPIPE) {
@@ -135,7 +142,7 @@ void AudioDevice::audioLoop() {
             }
         }
 
-        // De-interleave and convert input Channel 0 (Instrument) to float [-1.0, 1.0]
+        // De-interleave and convert input Channel 0 (Instrument / Mic) to float [-1.0, 1.0]
         for (size_t i = 0; i < static_cast<size_t>(frames_read); ++i) {
             mono_in[i] = static_cast<float>(in_buffer[i * channels + 0]) * INT32_TO_FLOAT;
         }
@@ -143,11 +150,13 @@ void AudioDevice::audioLoop() {
         // Process audio in LooperEngine
         engine_.process(mono_in.data(), stereo_out_left.data(), stereo_out_right.data(), frames_read);
 
-        // Interleave stereo outputs into 4-channel hardware buffer
+        // Convert and interleave stereo outputs into 4-channel hardware buffer
         // Ch0 = Left, Ch1 = Right, Ch2 = 0, Ch3 = 0
         for (size_t i = 0; i < static_cast<size_t>(frames_read); ++i) {
-            out_buffer[i * channels + 0] = static_cast<int32_t>(stereo_out_left[i] * FLOAT_TO_INT32);
-            out_buffer[i * channels + 1] = static_cast<int32_t>(stereo_out_right[i] * FLOAT_TO_INT32);
+            float l = std::clamp(stereo_out_left[i], -1.0f, 1.0f);
+            float r = std::clamp(stereo_out_right[i], -1.0f, 1.0f);
+            out_buffer[i * channels + 0] = static_cast<int32_t>(l * FLOAT_TO_INT32);
+            out_buffer[i * channels + 1] = static_cast<int32_t>(r * FLOAT_TO_INT32);
             out_buffer[i * channels + 2] = 0;
             out_buffer[i * channels + 3] = 0;
         }
@@ -157,6 +166,9 @@ void AudioDevice::audioLoop() {
         if (frames_written < 0) {
             if (frames_written == -EPIPE) {
                 handleXrun(playback_handle_, SND_PCM_STREAM_PLAYBACK);
+                // Re-seed with a period of silence to restore cushion
+                snd_pcm_writei(playback_handle_, silence.data(), period);
+                continue;
             } else {
                 std::cerr << "[ALSA] Playback error: " << snd_strerror(frames_written) << std::endl;
                 break;
