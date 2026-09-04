@@ -1,0 +1,19 @@
+# Build directory
+build/
+bin/
+obj/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+
+# Temp and audio files
+*.wav
+*.raw
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
