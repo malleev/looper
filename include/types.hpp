@@ -45,6 +45,7 @@ struct LooperStatus {
     size_t total_frames = 0;
     float current_sec = 0.0f;
     float total_sec = 0.0f;
+    float in_peak = 0.0f;        // 0.0 to 1.0 peak input level for VU-meter
     bool is_reversed = false;
     bool is_fading_out = false;
     bool undo_available = false;

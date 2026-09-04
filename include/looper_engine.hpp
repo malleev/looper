@@ -14,11 +14,9 @@ public:
     ~LooperEngine() = default;
 
     // Real-time audio processing (called from real-time audio thread)
-    // in: pointer to nframes of input audio (mono channel 0)
-    // out_left, out_right: pointers to nframes for stereo output
     void process(const float* in, float* out_left, float* out_right, size_t nframes);
 
-    // Control triggers (can be called from main/GPIO thread)
+    // Control triggers
     void triggerAction();      // Single footswitch logic: Rec -> Play -> Dub -> Play ...
     void triggerStop();        // Dedicated Stop
     void triggerClear();       // Clear all loops & reset to IDLE
@@ -42,6 +40,7 @@ private:
     std::atomic<bool> is_fading_out_{false};
     std::atomic<bool> undo_available_{false};
     std::atomic<bool> redo_available_{false};
+    std::atomic<float> in_peak_{0.0f};
 
     // Pre-allocated buffers to prevent dynamic allocation in audio thread
     static constexpr size_t MAX_LOOP_FRAMES = 48000 * 60 * 10; // 10 minutes max loop

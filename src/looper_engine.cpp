@@ -7,7 +7,6 @@ namespace looper {
 
 LooperEngine::LooperEngine(const LooperConfig& config)
     : config_(config) {
-    // Pre-allocate memory to guarantee no reallocation or syscalls in audio callback
     base_track_.reserve(MAX_LOOP_FRAMES);
     overdub_layer_.reserve(MAX_LOOP_FRAMES);
     undo_backup_.reserve(MAX_LOOP_FRAMES);
@@ -18,10 +17,14 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     float loop_gain = config_.loop_gain;
     LooperState current_state = state_.load(std::memory_order_relaxed);
 
+    float max_peak = 0.0f;
+
     for (size_t i = 0; i < nframes; ++i) {
         float in_sample = in[i];
+        float abs_in = std::abs(in_sample);
+        if (abs_in > max_peak) max_peak = abs_in;
 
-        // Dry pass-through (attenuated or full)
+        // Dry pass-through
         float left = in_sample * dry_gain;
         float right = in_sample * dry_gain;
 
@@ -55,7 +58,7 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
                 left += loop_sample;
                 right += loop_sample;
 
-                // Handle overdubbing: record directly into overdub layer
+                // Handle overdubbing
                 if (current_state == LooperState::OVERDUB) {
                     if (read_idx < overdub_layer_.size()) {
                         overdub_layer_[read_idx] += in_sample;
@@ -67,10 +70,12 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
             }
         }
 
-        // Soft limit / clamp to avoid digital wrapping
+        // Soft limit / clamp
         out_left[i] = std::clamp(left, -1.0f, 1.0f);
         out_right[i] = std::clamp(right, -1.0f, 1.0f);
     }
+
+    in_peak_.store(max_peak, std::memory_order_relaxed);
 }
 
 void LooperEngine::triggerAction() {
@@ -79,7 +84,6 @@ void LooperEngine::triggerAction() {
 
     switch (current) {
         case LooperState::IDLE: {
-            // Start recording base loop
             base_track_.clear();
             overdub_layer_.clear();
             undo_backup_.clear();
@@ -92,7 +96,6 @@ void LooperEngine::triggerAction() {
             break;
         }
         case LooperState::RECORDING: {
-            // Finish base loop -> Transition to PLAYING
             if (!base_track_.empty()) {
                 loop_length_ = base_track_.size();
                 applyLoopSeamCrossfade();
@@ -105,8 +108,6 @@ void LooperEngine::triggerAction() {
             break;
         }
         case LooperState::PLAYING: {
-            // Start overdubbing
-            // Save backup for undo
             undo_backup_ = base_track_;
             undo_available_.store(true, std::memory_order_relaxed);
             redo_available_.store(false, std::memory_order_relaxed);
@@ -116,7 +117,6 @@ void LooperEngine::triggerAction() {
             break;
         }
         case LooperState::OVERDUB: {
-            // Finish overdubbing -> Mix overdub into base track -> Return to PLAYING
             for (size_t i = 0; i < loop_length_; ++i) {
                 base_track_[i] = std::clamp(base_track_[i] + overdub_layer_[i], -1.0f, 1.0f);
             }
@@ -124,7 +124,6 @@ void LooperEngine::triggerAction() {
             break;
         }
         case LooperState::STOPPED: {
-            // Resume playback
             if (loop_length_ > 0) {
                 is_fading_out_.store(false, std::memory_order_relaxed);
                 state_.store(LooperState::PLAYING, std::memory_order_release);
@@ -139,7 +138,6 @@ void LooperEngine::triggerStop() {
     LooperState current = state_.load(std::memory_order_relaxed);
 
     if (current == LooperState::RECORDING) {
-        // If stopped during initial record, close loop and stay stopped
         if (!base_track_.empty()) {
             loop_length_ = base_track_.size();
             applyLoopSeamCrossfade();
@@ -149,7 +147,6 @@ void LooperEngine::triggerStop() {
             state_.store(LooperState::IDLE, std::memory_order_release);
         }
     } else if (current == LooperState::OVERDUB) {
-        // Commit active overdub before stopping
         for (size_t i = 0; i < loop_length_; ++i) {
             base_track_[i] = std::clamp(base_track_[i] + overdub_layer_[i], -1.0f, 1.0f);
         }
@@ -177,10 +174,8 @@ void LooperEngine::triggerUndoRedo() {
     std::lock_guard<std::mutex> lock(control_mutex_);
     if (undo_backup_.empty() || loop_length_ == 0) return;
 
-    // Swap active base track with undo backup
     base_track_.swap(undo_backup_);
     
-    // Toggle undo / redo flags
     bool was_undo = undo_available_.load(std::memory_order_relaxed);
     undo_available_.store(!was_undo, std::memory_order_relaxed);
     redo_available_.store(was_undo, std::memory_order_relaxed);
@@ -202,15 +197,13 @@ void LooperEngine::triggerFadeOut() {
 }
 
 void LooperEngine::applyLoopSeamCrossfade() {
-    // Crossfade loop seam to eliminate clicks/pops
     size_t xfade_len = std::min(static_cast<size_t>(config_.crossfade_samples), loop_length_ / 2);
     if (xfade_len == 0) return;
 
     size_t end_start = loop_length_ - xfade_len;
 
     for (size_t i = 0; i < xfade_len; ++i) {
-        float alpha = static_cast<float>(i) / static_cast<float>(xfade_len); // 0.0 -> 1.0
-        // Crossfade beginning with end
+        float alpha = static_cast<float>(i) / static_cast<float>(xfade_len);
         float start_sample = base_track_[i];
         float end_sample = base_track_[end_start + i];
 
@@ -225,6 +218,7 @@ LooperStatus LooperEngine::getStatus() const {
     s.total_frames = loop_length_;
     s.current_sec = static_cast<float>(playhead_) / config_.sample_rate;
     s.total_sec = static_cast<float>(loop_length_) / config_.sample_rate;
+    s.in_peak = in_peak_.load(std::memory_order_relaxed);
     s.is_reversed = is_reversed_.load(std::memory_order_relaxed);
     s.is_fading_out = is_fading_out_.load(std::memory_order_relaxed);
     s.undo_available = undo_available_.load(std::memory_order_relaxed);
