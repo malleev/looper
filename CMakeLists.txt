@@ -35,6 +35,7 @@ set(COMMON_SOURCES
     src/input_manager.cpp
     src/wav_file.cpp
     src/wav_worker.cpp
+    src/latency_calibrator.cpp
 )
 
 add_executable(looper src/main.cpp ${COMMON_SOURCES})
@@ -46,8 +47,9 @@ add_executable(looper_tests
     src/looper_engine.cpp
     src/wav_file.cpp
     src/wav_worker.cpp
+    src/latency_calibrator.cpp
 )
-target_link_libraries(looper_tests PRIVATE Threads::Threads)
+target_link_libraries(looper_tests PRIVATE ${ALSA_LIBRARIES} Threads::Threads)
 
 enable_testing()
 add_test(NAME unit_tests COMMAND looper_tests)

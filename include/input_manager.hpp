@@ -28,7 +28,7 @@ enum class ActionKey {
 
 class InputManager {
 public:
-    using KeyCallback = std::function<void(ActionKey)>;
+    using KeyCallback = std::function<void(ActionKey, uint64_t)>;
 
     explicit InputManager(KeyCallback callback);
     ~InputManager();

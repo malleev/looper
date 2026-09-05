@@ -4,6 +4,7 @@
 #include "audio_device.hpp"
 #include "input_manager.hpp"
 #include "wav_worker.hpp"
+#include "latency_calibrator.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -116,10 +117,114 @@ void printStatus(const looper::LooperStatus& status, float loop_gain, const loop
               << std::flush;
 }
 
+void printUsage(const char* prog) {
+    std::cout << "Usage: " << prog << " [options] [alsa_device]\n\n"
+              << "Options:\n"
+              << "  -c, --capture <dev>        ALSA capture device (default: hw:CARD=M1,DEV=0)\n"
+              << "  -p, --playback <dev>       ALSA playback device (default: matches capture)\n"
+              << "  --rate <hz>                Sample rate (default: 48000)\n"
+              << "  --period <frames>          Period buffer size (default: 128)\n"
+              << "  --periods <n>              Number of periods (default: 4)\n"
+              << "  -i, --in-channel <idx>     Capture channel index (default: 0)\n"
+              << "  --capture-channels <n>     Hardware capture channels (default: 4)\n"
+              << "  --playback-channels <n>    Hardware playback channels (default: 4)\n"
+              << "  -m, --monitor <mode>       Monitor mode: software (default) or analog\n"
+              << "  --latency <samples>        Latency compensation in samples (default: 384)\n"
+              << "  --pre-roll <samples>       Pre-roll buffer samples (default: 256)\n"
+              << "  --calibrate                Run automatic loopback RTL measurement (OUT 1 -> IN 1) and exit\n"
+              << "  -h, --help                 Display this help message\n";
+}
+
 int main(int argc, char* argv[]) {
-    std::string alsa_device = "hw:CARD=M1,DEV=0";
-    if (argc > 1) {
-        alsa_device = argv[1];
+    std::string capture_dev = "hw:CARD=M1,DEV=0";
+    std::string playback_dev = "";
+    uint32_t sample_rate = looper::DEFAULT_SAMPLE_RATE;
+    uint32_t period_size = looper::DEFAULT_PERIOD_SIZE;
+    uint32_t periods = looper::DEFAULT_PERIODS;
+    uint32_t cap_channels = looper::DEFAULT_CHANNELS;
+    uint32_t play_channels = looper::DEFAULT_CHANNELS;
+    uint32_t cap_index = 0;
+    looper::MonitorMode monitor_mode = looper::MonitorMode::SOFTWARE;
+    uint32_t latency_compensation = looper::DEFAULT_DIRECT_LATENCY;
+    uint32_t pre_roll = looper::PRE_ROLL_SAMPLES;
+    bool do_calibrate = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            printUsage(argv[0]);
+            return 0;
+        } else if (arg == "--calibrate") {
+            do_calibrate = true;
+        } else if ((arg == "-c" || arg == "--capture") && i + 1 < argc) {
+            capture_dev = argv[++i];
+        } else if ((arg == "-p" || arg == "--playback") && i + 1 < argc) {
+            playback_dev = argv[++i];
+        } else if (arg == "--rate" && i + 1 < argc) {
+            sample_rate = std::stoul(argv[++i]);
+        } else if (arg == "--period" && i + 1 < argc) {
+            period_size = std::stoul(argv[++i]);
+        } else if (arg == "--periods" && i + 1 < argc) {
+            periods = std::stoul(argv[++i]);
+        } else if ((arg == "-i" || arg == "--in-channel") && i + 1 < argc) {
+            cap_index = std::stoul(argv[++i]);
+        } else if (arg == "--capture-channels" && i + 1 < argc) {
+            cap_channels = std::stoul(argv[++i]);
+        } else if (arg == "--playback-channels" && i + 1 < argc) {
+            play_channels = std::stoul(argv[++i]);
+        } else if ((arg == "-m" || arg == "--monitor") && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m == "analog" || m == "direct" || m == "DIRECT_ANALOG") {
+                monitor_mode = looper::MonitorMode::DIRECT_ANALOG;
+            } else {
+                monitor_mode = looper::MonitorMode::SOFTWARE;
+            }
+        } else if (arg == "--latency" && i + 1 < argc) {
+            latency_compensation = std::stoul(argv[++i]);
+        } else if (arg == "--pre-roll" && i + 1 < argc) {
+            pre_roll = std::stoul(argv[++i]);
+        } else if (!arg.empty() && arg[0] != '-') {
+            // Positional argument sets both capture and playback (backwards compatibility)
+            capture_dev = arg;
+        }
+    }
+
+    if (playback_dev.empty()) {
+        playback_dev = capture_dev;
+    }
+
+    // Automated loopback latency calibration mode
+    if (do_calibrate) {
+        looper::AudioConfig cal_cfg;
+        cal_cfg.capture_device = capture_dev;
+        cal_cfg.playback_device = playback_dev;
+        cal_cfg.sample_rate = sample_rate;
+        cal_cfg.period_size = period_size;
+        cal_cfg.periods = periods;
+        cal_cfg.capture_channels = cap_channels;
+        cal_cfg.playback_channels = play_channels;
+        cal_cfg.capture_channel_index = cap_index;
+
+        std::cout << "=====================================================" << std::endl;
+        std::cout << "      AUTOMATED LOOPBACK LATENCY CALIBRATION         " << std::endl;
+        std::cout << "=====================================================" << std::endl;
+        std::cout << "Connect: Audio Output 1 -> Audio Input 1" << std::endl;
+        std::cout << "Capture:  " << cal_cfg.capture_device << " (ch " << cap_index << ")" << std::endl;
+        std::cout << "Playback: " << cal_cfg.playback_device << std::endl;
+        std::cout << "Rate:     " << sample_rate << " Hz, Period: " << period_size << " (" << periods << " periods)\n" << std::endl;
+
+        std::cout << "[CALIBRATING] Transmitting test impulses..." << std::endl;
+        auto res = looper::LatencyCalibrator::run(cal_cfg, 3);
+        if (res.success) {
+            std::cout << "\n[SUCCESS] " << res.message << std::endl;
+            std::cout << "  Measured RTL: " << res.latency_samples << " samples ("
+                      << std::fixed << std::setprecision(2) << res.latency_ms << " ms)" << std::endl;
+            std::cout << "  Recommended launch flag: --latency " << res.latency_samples << "\n" << std::endl;
+            return 0;
+        } else {
+            std::cerr << "\n[FAILED] " << res.message << "\n" << std::endl;
+            return 1;
+        }
     }
 
     std::signal(SIGINT, signalHandler);
@@ -130,7 +235,8 @@ int main(int argc, char* argv[]) {
     std::cout << "=====================================================" << std::endl;
     std::cout << "   ORANGE PI GUITAR LOOPER (Version C - Full MVP)    " << std::endl;
     std::cout << "=====================================================" << std::endl;
-    std::cout << "Audio device: " << alsa_device << std::endl;
+    std::cout << "Capture:  " << capture_dev << " (channel " << cap_index << ")" << std::endl;
+    std::cout << "Playback: " << playback_dev << std::endl;
     std::cout << "\nControls:" << std::endl;
     std::cout << "  [SPACE]     : Rec -> Play -> Overdub -> Play" << std::endl;
     std::cout << "  [S]         : Stop playback" << std::endl;
@@ -147,14 +253,14 @@ int main(int argc, char* argv[]) {
     std::cout << "=====================================================\n" << std::endl;
 
     looper::LooperConfig config;
-    config.sample_rate = 48000;
-    config.period_size = 128; // ~2.67 ms buffer
-    config.monitor_mode = looper::MonitorMode::SOFTWARE; // Default to software monitoring for MiniFuse prototype
-    config.dry_gain = 1.0f;   // Direct dry passthrough enabled
+    config.sample_rate = sample_rate;
+    config.period_size = period_size;
+    config.monitor_mode = monitor_mode;
+    config.dry_gain = (monitor_mode == looper::MonitorMode::SOFTWARE) ? 1.0f : 0.0f;
     config.loop_gain = 1.0f;
     config.fade_out_sec = 3.0f;
-    config.latency_compensation = 384; // Test value for DIRECT_ANALOG mode
-    config.pre_roll = 256;             // ~5.3 ms pre-roll to catch note attack
+    config.latency_compensation = latency_compensation;
+    config.pre_roll = pre_roll;
 
     // Pure SPSC queues for thread-safe decoupled communication
     looper::ControlQueue ctrl_queue;
@@ -173,20 +279,21 @@ int main(int argc, char* argv[]) {
     looper::LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
 
     looper::AudioConfig audio_cfg;
-    audio_cfg.capture_device = alsa_device;
-    audio_cfg.playback_device = alsa_device;
+    audio_cfg.capture_device = capture_dev;
+    audio_cfg.playback_device = playback_dev;
     audio_cfg.sample_rate = config.sample_rate;
     audio_cfg.period_size = config.period_size;
-    audio_cfg.periods = looper::DEFAULT_PERIODS;
-    audio_cfg.capture_channels = looper::DEFAULT_CHANNELS;
-    audio_cfg.playback_channels = looper::DEFAULT_CHANNELS;
-    audio_cfg.capture_channel_index = 0;
+    audio_cfg.periods = periods;
+    audio_cfg.capture_channels = cap_channels;
+    audio_cfg.playback_channels = play_channels;
+    audio_cfg.capture_channel_index = cap_index;
 
     looper::AudioDevice audio_device(audio_cfg, engine, config);
 
     std::cout << "[SYSTEM] Initializing audio device..." << std::endl;
     if (!audio_device.start()) {
-        std::cerr << "[ERROR] Failed to start audio device on " << alsa_device << std::endl;
+        std::cerr << "[ERROR] Failed to start audio device (capture: " << capture_dev 
+                  << ", playback: " << playback_dev << ")" << std::endl;
         wav_worker.stop();
         return 1;
     }
@@ -221,11 +328,12 @@ int main(int argc, char* argv[]) {
 
     std::atomic<float> current_loop_gain{config.loop_gain};
 
-    looper::InputManager input_manager([&](looper::ActionKey key) {
+    looper::InputManager input_manager([&](looper::ActionKey key, uint64_t ts_ns) {
         switch (key) {
             case looper::ActionKey::ACTION: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::ACTION;
+                cmd.timestamp_ns = ts_ns;
                 if (!ctrl_queue.push(cmd)) {
                     setInfoMessage("Error: command queue full", 2);
                 }
@@ -234,6 +342,7 @@ int main(int argc, char* argv[]) {
             case looper::ActionKey::STOP: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::STOP;
+                cmd.timestamp_ns = ts_ns;
                 if (!ctrl_queue.push(cmd)) {
                     setInfoMessage("Error: command queue full", 2);
                 }
@@ -242,6 +351,7 @@ int main(int argc, char* argv[]) {
             case looper::ActionKey::CLEAR: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::CLEAR;
+                cmd.timestamp_ns = ts_ns;
                 if (ctrl_queue.push(cmd)) {
                     setInfoMessage("Loop cleared", 2);
                 }
@@ -250,6 +360,7 @@ int main(int argc, char* argv[]) {
             case looper::ActionKey::UNDO: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::UNDO_REDO;
+                cmd.timestamp_ns = ts_ns;
                 if (ctrl_queue.push(cmd)) {
                     setInfoMessage("Undo / Redo triggered", 2);
                 }
@@ -258,12 +369,14 @@ int main(int argc, char* argv[]) {
             case looper::ActionKey::REVERSE: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::TOGGLE_REVERSE;
+                cmd.timestamp_ns = ts_ns;
                 ctrl_queue.push(cmd);
                 break;
             }
             case looper::ActionKey::FADE: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::TRIGGER_FADE;
+                cmd.timestamp_ns = ts_ns;
                 ctrl_queue.push(cmd);
                 break;
             }
@@ -275,6 +388,7 @@ int main(int argc, char* argv[]) {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::SET_MONITOR_MODE;
                 cmd.int_param = static_cast<int>(next_mode);
+                cmd.timestamp_ns = ts_ns;
                 if (ctrl_queue.push(cmd)) {
                     if (next_mode == looper::MonitorMode::DIRECT_ANALOG) {
                         setInfoMessage("Monitor: DIRECT ANALOG (K=" + std::to_string(s.configured_latency_samples) + " smp, Dry: OFF)", 2);
@@ -326,6 +440,7 @@ int main(int argc, char* argv[]) {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::ADJUST_LATENCY;
                 cmd.int_param = +32;
+                cmd.timestamp_ns = ts_ns;
                 if (ctrl_queue.push(cmd)) {
                     setInfoMessage("Latency +32 smp", 1);
                 }
@@ -335,6 +450,7 @@ int main(int argc, char* argv[]) {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::ADJUST_LATENCY;
                 cmd.int_param = -32;
+                cmd.timestamp_ns = ts_ns;
                 if (ctrl_queue.push(cmd)) {
                     setInfoMessage("Latency -32 smp", 1);
                 }
@@ -347,6 +463,7 @@ int main(int argc, char* argv[]) {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::SET_LOOP_GAIN;
                 cmd.float_param = updated;
+                cmd.timestamp_ns = ts_ns;
                 ctrl_queue.push(cmd);
                 break;
             }
@@ -357,6 +474,7 @@ int main(int argc, char* argv[]) {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::SET_LOOP_GAIN;
                 cmd.float_param = updated;
+                cmd.timestamp_ns = ts_ns;
                 ctrl_queue.push(cmd);
                 break;
             }

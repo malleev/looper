@@ -20,7 +20,7 @@ public:
     ~LooperEngine();
 
     // REAL-TIME AUDIO PROCESSING (Runs strictly on real-time audio thread)
-    void process(const float* in, float* out_left, float* out_right, size_t nframes);
+    void process(const float* in, float* out_left, float* out_right, size_t nframes, uint64_t block_start_ns = 0);
 
     // Thread-safe query for UI
     LooperStatus getStatus() const;
@@ -28,6 +28,10 @@ public:
 private:
     // Process pending commands on audio block boundaries
     void processPendingCommands();
+    void processLoadAndSaveCommands();
+    void executeControlCommand(const ControlCommand& cmd);
+    void processAudioSlice(const float* in, float* out_left, float* out_right,
+                           size_t start_frame, size_t end_frame, float& max_peak);
     void applyLoopSeamCrossfade();
     void abortActiveSave();
     void commitOverdubTake();

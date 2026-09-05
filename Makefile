@@ -5,10 +5,10 @@ LDFLAGS ?= -lasound -lpthread
 TARGET = looper
 TEST_TARGET = looper_tests
 
-SRCS = src/main.cpp src/audio_device.cpp src/looper_engine.cpp src/input_manager.cpp src/wav_file.cpp src/wav_worker.cpp
+SRCS = src/main.cpp src/audio_device.cpp src/looper_engine.cpp src/input_manager.cpp src/wav_file.cpp src/wav_worker.cpp src/latency_calibrator.cpp
 OBJS = $(SRCS:.cpp=.o)
 
-TEST_SRCS = test/test_suite.cpp src/looper_engine.cpp src/wav_file.cpp src/wav_worker.cpp
+TEST_SRCS = test/test_suite.cpp src/looper_engine.cpp src/wav_file.cpp src/wav_worker.cpp src/latency_calibrator.cpp
 
 all: $(TARGET)
 
@@ -16,7 +16,7 @@ $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(TEST_TARGET): $(TEST_SRCS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 test: $(TEST_TARGET)
 	./$(TEST_TARGET)

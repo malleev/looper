@@ -26,6 +26,8 @@ struct ControlCommand {
     ControlCommandType type = ControlCommandType::NONE;
     int32_t int_param = 0;
     float float_param = 0.0f;
+    uint32_t sample_offset = 0; // 0..period-1: intra-block frame index
+    uint64_t timestamp_ns = 0;  // CLOCK_MONOTONIC timestamp
 };
 
 struct LoadCommand {

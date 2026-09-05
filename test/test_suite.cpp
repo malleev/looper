@@ -3,6 +3,7 @@
 #include "wav_file.hpp"
 #include "wav_worker.hpp"
 #include "looper_engine.hpp"
+#include "latency_calibrator.hpp"
 
 #include <iostream>
 #include <cassert>
@@ -1293,6 +1294,162 @@ void test_clear_o1_timing_on_large_loop() {
     std::cout << "PASSED! (Elapsed: " << elapsed_us << " us)" << std::endl;
 }
 
+void test_reverse_continuity_no_position_jump() {
+    std::cout << "[TEST] Reverse Continuity (No Position Jump Across Seam)... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+    config.dry_gain = 0.0f; // Only loop playback
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    // Record a linear ramp loop: sample i has value i * 0.001f
+    // 4 periods = 512 samples
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+
+    std::vector<float> in(128);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    for (int p = 0; p < 4; ++p) {
+        for (int i = 0; i < 128; ++i) {
+            in[i] = static_cast<float>(p * 128 + i) * 0.001f;
+        }
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    // Stop record -> playing
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().total_frames == 512);
+
+    // Play 1 more period forward: out_l[127] is sample at playhead ~255
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    float last_fwd_sample = out_l[127];
+
+    // Toggle reverse!
+    cmd.type = ControlCommandType::TOGGLE_REVERSE;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+
+    // With reverse continuity, the first sample in the new period must continue from last_fwd_sample!
+    // Ramp slope is 0.001f per sample. Jump must NOT be large (without continuity it would jump by ~0.25f)!
+    float first_rev_sample = out_l[0];
+    float jump = std::abs(first_rev_sample - last_fwd_sample);
+    assert(jump < 0.005f); // Max 5 samples delta, continuous!
+
+    // Play backwards and verify decreasing slope
+    assert(out_l[10] > out_l[20]);
+
+    // Toggle back to forward!
+    float last_rev_sample = out_l[127];
+    cmd.type = ControlCommandType::TOGGLE_REVERSE;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    float first_fwd_sample = out_l[0];
+    float jump_back = std::abs(first_fwd_sample - last_rev_sample);
+    assert(jump_back < 0.005f); // Smooth continuity in both directions!
+
+    std::cout << "PASSED!" << std::endl;
+}
+
+void test_sample_accurate_action_trigger() {
+    std::cout << "[TEST] Sample-Accurate Action Trigger (Sub-Block Timing)... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+    config.dry_gain = 0.0f;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.5f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // 1. Start recording at block boundary
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    cmd.sample_offset = 0;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::RECORDING);
+    assert(engine.getStatus().total_frames == 128);
+
+    // 2. In second block, press ACTION mid-block at exactly sample 48
+    cmd.type = ControlCommandType::ACTION;
+    cmd.sample_offset = 48;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f); // Live input becomes silent
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+
+    // State must now be PLAYING!
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    // Total frames must be exactly 128 + 48 = 176 samples! Not quantized to 128 or 256!
+    assert(engine.getStatus().total_frames == 176);
+
+    // From sample 48 to 127 in this block, the engine immediately played back the recorded 0.5f loop!
+    // Frame 0..47 was silent live input (0.0f), while 48..127 must have loop playback (0.5f)!
+    for (size_t i = 0; i < 48; ++i) {
+        assert(std::abs(out_l[i]) < 1e-4f);
+    }
+    for (size_t i = 48; i < 128; ++i) {
+        assert(std::abs(out_l[i] - 0.5f) < 1e-4f);
+    }
+
+    std::cout << "PASSED! (Length: " << engine.getStatus().total_frames << " frames, exact 176)" << std::endl;
+}
+
+void test_latency_calibrator_pulse_detection() {
+    std::cout << "[TEST] Latency Calibrator Pulse Detection & Median Filter... " << std::flush;
+
+    // 1. Synthetic pulse detection with background noise
+    std::vector<float> buffer(256, 0.02f); // Noise floor 0.02
+    buffer[73] = 0.85f; // Sharp pulse at index 73
+
+    int32_t detected = LatencyCalibrator::detectPulseOffset(buffer.data(), buffer.size(), 0.25f);
+    assert(detected == 73);
+
+    // 2. Negative case: no signal above threshold
+    std::vector<float> silence(256, 0.05f);
+    assert(LatencyCalibrator::detectPulseOffset(silence.data(), silence.size(), 0.25f) == -1);
+
+    // 3. Null / empty safety
+    assert(LatencyCalibrator::detectPulseOffset(nullptr, 0, 0.25f) == -1);
+
+    // 4. Median filter test
+    std::vector<uint32_t> measurements = {390, 384, 382};
+    uint32_t med = LatencyCalibrator::calculateMedian(measurements);
+    assert(med == 384);
+
+    std::vector<uint32_t> even_measurements = {380, 384, 386, 390};
+    uint32_t med_even = LatencyCalibrator::calculateMedian(even_measurements);
+    assert(med_even == 385);
+
+    std::cout << "PASSED!" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  RUNNING LOOPER ENGINE UNIT TESTS      " << std::endl;
@@ -1317,8 +1474,11 @@ int main() {
     test_action_aborts_active_save();
     test_prefaulted_buffers_and_telemetry();
     test_clear_o1_timing_on_large_loop();
+    test_reverse_continuity_no_position_jump();
+    test_sample_accurate_action_trigger();
+    test_latency_calibrator_pulse_detection();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (19/19)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (22/22)" << std::endl;
     return 0;
 }
 

@@ -421,7 +421,10 @@ void AudioDevice::audioLoop() {
 
         // Process audio in LooperEngine with execution timing
         auto t_start = std::chrono::steady_clock::now();
-        engine_.process(mono_in_.data(), stereo_out_left_.data(), stereo_out_right_.data(), frames_read);
+        uint64_t block_start_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_start.time_since_epoch()).count()
+        );
+        engine_.process(mono_in_.data(), stereo_out_left_.data(), stereo_out_right_.data(), frames_read, block_start_ns);
         auto t_end = std::chrono::steady_clock::now();
 
         uint32_t elapsed_us = static_cast<uint32_t>(

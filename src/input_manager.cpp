@@ -128,7 +128,13 @@ void InputManager::workerLoop() {
                         case 'q': case 'Q': ak = ActionKey::QUIT; break;
                         default: break;
                     }
-                    if (ak != ActionKey::NONE && callback_) callback_(ak);
+                    if (ak != ActionKey::NONE && callback_) {
+                        auto now = std::chrono::steady_clock::now();
+                        uint64_t ts_ns = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()
+                        );
+                        callback_(ak, ts_ns);
+                    }
                 }
             }
             idx = 1;
@@ -158,7 +164,13 @@ void InputManager::workerLoop() {
                             case KEY_Q: case KEY_ESC: ak = ActionKey::QUIT; break;
                             default: break;
                         }
-                        if (ak != ActionKey::NONE && callback_) callback_(ak);
+                        if (ak != ActionKey::NONE && callback_) {
+                            auto now = std::chrono::steady_clock::now();
+                            uint64_t ts_ns = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()
+                            );
+                            callback_(ak, ts_ns);
+                        }
                     }
                 }
             }
