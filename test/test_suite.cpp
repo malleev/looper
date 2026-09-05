@@ -1175,6 +1175,71 @@ void test_action_aborts_active_save() {
     std::cout << "PASSED!" << std::endl;
 }
 
+void test_prefaulted_buffers_and_telemetry() {
+    std::cout << "[TEST] Prefaulted Fixed Buffers & AudioTelemetry Lock-Free Invariants... " << std::flush;
+
+    // Verify AudioTelemetry lock-free properties
+    AudioTelemetry tele;
+    assert(tele.capture_xruns.is_lock_free());
+    assert(tele.playback_xruns.is_lock_free());
+    assert(tele.short_writes.is_lock_free());
+    assert(tele.recoveries.is_lock_free());
+    assert(tele.fatal_audio_errors.is_lock_free());
+    assert(tele.process_max_us.is_lock_free());
+    assert(tele.process_avg_us.is_lock_free());
+    assert(tele.rt_priority_acquired.is_lock_free());
+
+    // Verify AudioConfig defaults
+    AudioConfig cfg;
+    assert(cfg.sample_rate == 48000);
+    assert(cfg.period_size == 128);
+    assert(cfg.periods == 4);
+    assert(cfg.capture_channels == 4);
+    assert(cfg.playback_channels == 4);
+
+    // Verify engine fixed buffers
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.7f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // Record 1 block without push_back reallocation
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::RECORDING);
+
+    // Complete recording
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().total_frames == 128);
+
+    // Clear loop -> logical size reset, memory remains pre-allocated
+    cmd.type = ControlCommandType::CLEAR;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::IDLE);
+    assert(engine.getStatus().total_frames == 0);
+
+    std::cout << "PASSED!" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  RUNNING LOOPER ENGINE UNIT TESTS      " << std::endl;
@@ -1197,8 +1262,9 @@ int main() {
     test_undo_disallowed_during_overdub();
     test_fade_during_overdub_preserves_take();
     test_action_aborts_active_save();
+    test_prefaulted_buffers_and_telemetry();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (17/17)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (18/18)" << std::endl;
     return 0;
 }
 

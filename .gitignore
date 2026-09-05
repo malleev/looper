@@ -1,9 +1,11 @@
 # Build directory and binaries
-build/
+build*/
 bin/
 obj/
 looper
+looper_tests
 test_looper
+test_asan
 *.o
 *.a
 *.so

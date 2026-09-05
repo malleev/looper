@@ -32,6 +32,7 @@ struct LoadCommand {
     std::vector<float>* base_buffer = nullptr;
     std::vector<float>* layer_buffer = nullptr;
     std::vector<float>* record_buffer = nullptr;
+    size_t loop_length = 0;
 };
 
 struct SaveSlotCommand {

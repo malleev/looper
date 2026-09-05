@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <atomic>
 
 namespace looper {
 
@@ -75,6 +76,47 @@ struct LooperStatus {
     bool is_fading_out = false;
     bool undo_available = false;
     bool redo_available = false;
+};
+
+struct AudioConfig {
+    std::string capture_device = "hw:CARD=M1,DEV=0";
+    std::string playback_device = "hw:CARD=M1,DEV=0";
+    uint32_t sample_rate = DEFAULT_SAMPLE_RATE;
+    uint32_t period_size = DEFAULT_PERIOD_SIZE;
+    uint32_t periods = DEFAULT_PERIODS;
+    uint32_t capture_channels = DEFAULT_CHANNELS;
+    uint32_t playback_channels = DEFAULT_CHANNELS;
+    uint32_t capture_channel_index = 0;
+};
+
+struct PcmParams {
+    uint32_t sample_rate = 0;
+    uint32_t period_size = 0;
+    uint32_t buffer_size = 0;
+    uint32_t periods = 0;
+    uint32_t channels = 0;
+};
+
+struct AudioTelemetry {
+    std::atomic<uint64_t> capture_xruns{0};
+    std::atomic<uint64_t> playback_xruns{0};
+    std::atomic<uint64_t> short_writes{0};
+    std::atomic<uint64_t> recoveries{0};
+    std::atomic<uint64_t> fatal_audio_errors{0};
+    std::atomic<uint32_t> process_max_us{0};
+    std::atomic<uint32_t> process_avg_us{0};
+    std::atomic<bool> rt_priority_acquired{false};
+};
+
+struct AudioTelemetrySnapshot {
+    uint64_t capture_xruns = 0;
+    uint64_t playback_xruns = 0;
+    uint64_t short_writes = 0;
+    uint64_t recoveries = 0;
+    uint64_t fatal_audio_errors = 0;
+    uint32_t process_max_us = 0;
+    uint32_t process_avg_us = 0;
+    bool rt_priority_acquired = false;
 };
 
 } // namespace looper

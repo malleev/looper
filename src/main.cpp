@@ -33,7 +33,7 @@ void signalHandler(int) {
     g_running.store(false);
 }
 
-void printStatus(const looper::LooperStatus& status, float loop_gain) {
+void printStatus(const looper::LooperStatus& status, float loop_gain, const looper::AudioTelemetrySnapshot& tele) {
     std::cout << "\r\033[2K"; // Clear line
 
     // If there's an active notification message, show it
@@ -108,7 +108,11 @@ void printStatus(const looper::LooperStatus& status, float loop_gain) {
               << " | ";
 
     // Volume
-    std::cout << "VOL:" << std::setw(3) << static_cast<int>(loop_gain * 100) << "%"
+    std::cout << "VOL:" << std::setw(3) << static_cast<int>(loop_gain * 100) << "%";
+
+    // Telemetry (XRUNs and audio callback execution time)
+    std::cout << " | XRUN:C:" << tele.capture_xruns << "/P:" << tele.playback_xruns
+              << " | RT:" << tele.process_avg_us << "us(max:" << tele.process_max_us << "us)"
               << std::flush;
 }
 
@@ -165,9 +169,20 @@ int main(int argc, char* argv[]) {
     });
     wav_worker.start();
 
-    // Audio Engine and ALSA device
+    // Audio Engine and ALSA device configuration
     looper::LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
-    looper::AudioDevice audio_device(alsa_device, engine, config);
+
+    looper::AudioConfig audio_cfg;
+    audio_cfg.capture_device = alsa_device;
+    audio_cfg.playback_device = alsa_device;
+    audio_cfg.sample_rate = config.sample_rate;
+    audio_cfg.period_size = config.period_size;
+    audio_cfg.periods = looper::DEFAULT_PERIODS;
+    audio_cfg.capture_channels = looper::DEFAULT_CHANNELS;
+    audio_cfg.playback_channels = looper::DEFAULT_CHANNELS;
+    audio_cfg.capture_channel_index = 0;
+
+    looper::AudioDevice audio_device(audio_cfg, engine, config);
 
     std::cout << "[SYSTEM] Initializing audio device..." << std::endl;
     if (!audio_device.start()) {
@@ -176,6 +191,33 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::cout << "[SYSTEM] Audio engine started successfully!" << std::endl;
+
+    const auto& cap = audio_device.getCaptureParams();
+    const auto& play = audio_device.getPlaybackParams();
+
+    std::cout << "\nCapture:\n"
+              << "  device    " << audio_cfg.capture_device << "\n"
+              << "  rate      " << cap.sample_rate << "\n"
+              << "  period    " << cap.period_size << "\n"
+              << "  periods   " << cap.periods << "\n"
+              << "  buffer    " << cap.buffer_size << "\n"
+              << "  channels  " << cap.channels << "\n" << std::endl;
+
+    std::cout << "Playback:\n"
+              << "  device    " << audio_cfg.playback_device << "\n"
+              << "  rate      " << play.sample_rate << "\n"
+              << "  period    " << play.period_size << "\n"
+              << "  periods   " << play.periods << "\n"
+              << "  buffer    " << play.buffer_size << "\n"
+              << "  channels  " << play.channels << "\n" << std::endl;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    auto init_tele = audio_device.getTelemetrySnapshot();
+    if (init_tele.rt_priority_acquired) {
+        std::cout << "[AUDIO] Real-time thread priority set to SCHED_FIFO 80." << std::endl;
+    } else {
+        std::cout << "[AUDIO] Warning: Real-time SCHED_FIFO priority not acquired (running normal priority)." << std::endl;
+    }
 
     std::atomic<float> current_loop_gain{config.loop_gain};
 
@@ -331,7 +373,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[SYSTEM] Input manager ready. Waiting for triggers...\n" << std::endl;
 
     while (g_running.load()) {
-        printStatus(engine.getStatus(), current_loop_gain.load(std::memory_order_relaxed));
+        printStatus(engine.getStatus(), current_loop_gain.load(std::memory_order_relaxed), audio_device.getTelemetrySnapshot());
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 

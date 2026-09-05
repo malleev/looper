@@ -1,0 +1,46 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasound2-dev
+
+    - name: Configure & Build Release
+      run: |
+        cmake -B build -DCMAKE_BUILD_TYPE=Release
+        cmake --build build -j$(nproc)
+
+    - name: Run Unit Tests (Release)
+      run: |
+        ctest --test-dir build --output-on-failure
+
+    - name: Configure & Build with ASan + UBSan
+      run: |
+        cmake -B build_asan -DENABLE_ASAN=ON
+        cmake --build build_asan -j$(nproc)
+
+    - name: Run Unit Tests (ASan + UBSan)
+      run: |
+        ctest --test-dir build_asan --output-on-failure
+
+    - name: Configure & Build with TSan
+      run: |
+        cmake -B build_tsan -DENABLE_TSAN=ON
+        cmake --build build_tsan -j$(nproc)
+
+    - name: Run Unit Tests (TSan)
+      run: |
+        ctest --test-dir build_tsan --output-on-failure
