@@ -118,7 +118,7 @@ void InputManager::workerLoop() {
                         case 'u': case 'U': ak = ActionKey::UNDO; break;
                         case 'r': case 'R': ak = ActionKey::REVERSE; break;
                         case 'f': case 'F': ak = ActionKey::FADE; break;
-                        case 'm': case 'M': ak = ActionKey::DRY_TOGGLE; break;
+                        case 'm': case 'M': ak = ActionKey::TOGGLE_MONITOR; break;
                         case 'w': case 'W': ak = ActionKey::SAVE_WAV; break;
                         case 'l': case 'L': ak = ActionKey::LOAD_WAV; break;
                         case '>': case '.': ak = ActionKey::LATENCY_UP; break;
@@ -148,7 +148,7 @@ void InputManager::workerLoop() {
                             case KEY_U: ak = ActionKey::UNDO; break;
                             case KEY_R: ak = ActionKey::REVERSE; break;
                             case KEY_F: ak = ActionKey::FADE; break;
-                            case KEY_M: ak = ActionKey::DRY_TOGGLE; break;
+                            case KEY_M: ak = ActionKey::TOGGLE_MONITOR; break;
                             case KEY_W: ak = ActionKey::SAVE_WAV; break;
                             case KEY_L: ak = ActionKey::LOAD_WAV; break;
                             case KEY_DOT: case KEY_RIGHT: ak = ActionKey::LATENCY_UP; break;

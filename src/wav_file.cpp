@@ -62,10 +62,10 @@ bool WavFile::save(const std::string& filepath, const std::vector<float>& sample
     return true;
 }
 
-bool WavFile::load(const std::string& filepath, std::vector<float>& out_samples, uint32_t& out_sample_rate) {
+bool WavFile::load(const std::string& filepath, std::vector<float>& out_samples, uint32_t expected_sample_rate, std::string& error_msg) {
     std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[WAV] Failed to open file for reading: " << filepath << std::endl;
+        error_msg = "Cannot open file: " + filepath;
         return false;
     }
 
@@ -74,7 +74,7 @@ bool WavFile::load(const std::string& filepath, std::vector<float>& out_samples,
 
     file.read(chunk_id, 4);
     if (std::memcmp(chunk_id, "RIFF", 4) != 0) {
-        std::cerr << "[WAV] Not a valid RIFF file." << std::endl;
+        error_msg = "Not a valid RIFF file: " + filepath;
         return false;
     }
 
@@ -82,12 +82,12 @@ bool WavFile::load(const std::string& filepath, std::vector<float>& out_samples,
     char wave_id[4];
     file.read(wave_id, 4);
     if (std::memcmp(wave_id, "WAVE", 4) != 0) {
-        std::cerr << "[WAV] Not a valid WAVE file." << std::endl;
+        error_msg = "Not a valid WAVE file: " + filepath;
         return false;
     }
 
     uint16_t channels = 1;
-    uint32_t sample_rate = 48000;
+    uint32_t sample_rate = 0;
     uint16_t bits_per_sample = 16;
     bool fmt_found = false;
 
@@ -100,25 +100,29 @@ bool WavFile::load(const std::string& filepath, std::vector<float>& out_samples,
             file.seekg(6, std::ios::cur); // skip byte_rate & block_align
             file.read(reinterpret_cast<char*>(&bits_per_sample), 2);
 
-            // Skip any extra bytes in fmt chunk
+            // Strict sample rate check!
+            if (expected_sample_rate > 0 && sample_rate != expected_sample_rate) {
+                error_msg = "Sample rate mismatch: expected " + std::to_string(expected_sample_rate) +
+                            " Hz, got " + std::to_string(sample_rate) + " Hz";
+                return false;
+            }
+
             if (chunk_size > 16) {
                 file.seekg(chunk_size - 16, std::ios::cur);
             }
             fmt_found = true;
         } else if (std::memcmp(chunk_id, "data", 4) == 0) {
             if (!fmt_found) {
-                std::cerr << "[WAV] data chunk found before fmt chunk." << std::endl;
+                error_msg = "Corrupted WAV: data chunk found before fmt chunk";
                 return false;
             }
 
-            out_sample_rate = sample_rate;
             if (bits_per_sample == 16) {
                 size_t num_samples = chunk_size / (channels * sizeof(int16_t));
                 out_samples.resize(num_samples);
                 std::vector<int16_t> raw_buf(channels);
                 for (size_t i = 0; i < num_samples; ++i) {
                     file.read(reinterpret_cast<char*>(raw_buf.data()), channels * sizeof(int16_t));
-                    // Take first channel (mono)
                     out_samples[i] = static_cast<float>(raw_buf[0]) / 32768.0f;
                 }
             } else if (bits_per_sample == 24) {
@@ -128,22 +132,21 @@ bool WavFile::load(const std::string& filepath, std::vector<float>& out_samples,
                 for (size_t i = 0; i < num_samples; ++i) {
                     file.read(reinterpret_cast<char*>(raw_buf.data()), channels * 3);
                     int32_t val = (raw_buf[0]) | (raw_buf[1] << 8) | (raw_buf[2] << 16);
-                    if (val & 0x800000) val |= 0xFF000000; // Sign extend
+                    if (val & 0x800000) val |= 0xFF000000;
                     out_samples[i] = static_cast<float>(val) / 8388608.0f;
                 }
             } else {
-                std::cerr << "[WAV] Unsupported bits per sample: " << bits_per_sample << std::endl;
+                error_msg = "Unsupported bits per sample: " + std::to_string(bits_per_sample);
                 return false;
             }
 
-            std::cout << "[WAV] Loaded " << out_samples.size() << " samples from " << filepath << std::endl;
             return true;
         } else {
-            // Skip unknown chunk
             file.seekg(chunk_size, std::ios::cur);
         }
     }
 
+    error_msg = "No data chunk found in WAV";
     return false;
 }
 

@@ -3,6 +3,7 @@ build/
 bin/
 obj/
 looper
+test_looper
 *.o
 *.a
 *.so

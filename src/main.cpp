@@ -1,7 +1,9 @@
 #include "types.hpp"
+#include "command_queue.hpp"
 #include "looper_engine.hpp"
 #include "audio_device.hpp"
 #include "input_manager.hpp"
+#include "wav_worker.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -28,7 +30,7 @@ void signalHandler(int) {
     g_running.store(false);
 }
 
-void printStatus(const looper::LooperStatus& status, float loop_gain, float dry_gain) {
+void printStatus(const looper::LooperStatus& status, float loop_gain) {
     std::cout << "\r\033[2K"; // Clear line
 
     // If there's an active notification message, show it
@@ -82,17 +84,20 @@ void printStatus(const looper::LooperStatus& status, float loop_gain, float dry_
               << std::setw(4) << status.current_sec << "/" 
               << std::setw(4) << status.total_sec << "s | ";
 
-    // Latency compensation (12 chars)
-    std::cout << "LAT:" << std::setw(3) << status.latency_samples << "smp | ";
+    // Monitor Mode & Effective Latency
+    if (status.monitor_mode == looper::MonitorMode::DIRECT_ANALOG) {
+        std::cout << "MON:\033[1;33mANALOG\033[0m(K=" << status.effective_latency_samples << ") | ";
+    } else {
+        std::cout << "MON:\033[1;32mSOFT\033[0m(K=0) | ";
+    }
 
-    // Flags (13 chars)
+    // Flags
     std::cout << "R:" << (status.is_reversed ? "\033[1;35mON \033[0m" : "OFF ")
-              << "U:" << (status.undo_available ? "\033[1;32mYES \033[0m" : "NO  ")
-              << "| ";
+              << "U:" << (status.undo_available ? "\033[1;32mYES\033[0m" : (status.redo_available ? "\033[1;36mREDO\033[0m" : "NO "))
+              << " | ";
 
-    // Volume & Dry (15 chars)
-    std::cout << "V:" << std::setw(3) << static_cast<int>(loop_gain * 100) << "% "
-              << "DRY:" << (dry_gain > 0.05f ? "\033[1;32mON\033[0m" : "OFF")
+    // Volume
+    std::cout << "VOL:" << std::setw(3) << static_cast<int>(loop_gain * 100) << "%"
               << std::flush;
 }
 
@@ -118,7 +123,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  [U]         : Undo / Redo last overdub layer" << std::endl;
     std::cout << "  [R]         : Toggle Reverse playback" << std::endl;
     std::cout << "  [F]         : Trigger smooth Fade-Out to stop" << std::endl;
-    std::cout << "  [M]         : Toggle software Dry Monitor (on/off)" << std::endl;
+    std::cout << "  [M]         : Toggle Monitor Mode (Direct Analog vs Software Dry)" << std::endl;
     std::cout << "  [W]         : Save loop to WAV (in recordings/)" << std::endl;
     std::cout << "  [L]         : Load latest WAV from recordings/" << std::endl;
     std::cout << "  [>] / [<]   : Adjust Latency compensation (+/- 32 samples)" << std::endl;
@@ -129,60 +134,109 @@ int main(int argc, char* argv[]) {
     looper::LooperConfig config;
     config.sample_rate = 48000;
     config.period_size = 128; // ~2.67 ms buffer
-    config.dry_gain = 1.0f;   // Direct Monitor ON by default
+    config.monitor_mode = looper::MonitorMode::DIRECT_ANALOG; // Default to direct analog hardware monitoring
+    config.dry_gain = 1.0f;   // Software dry volume (used when monitor_mode is SOFTWARE)
     config.loop_gain = 1.0f;
     config.fade_out_sec = 3.0f;
     config.latency_compensation = 384; // ~8.0 ms (1 capture period + 2 playback cushion periods)
     config.pre_roll = 256;             // ~5.3 ms pre-roll to catch note attack
 
-    looper::LooperEngine engine(config);
+    // Lock-free queues for thread communication
+    looper::CommandQueue to_engine_queue;
+    looper::BufferReturnQueue from_engine_queue;
+    looper::SaveQueue save_queue;
+
+    // Background worker for non-blocking file I/O
+    looper::WavWorker wav_worker(to_engine_queue, from_engine_queue, save_queue, [](const std::string& msg, bool is_error) {
+        setInfoMessage(msg, is_error ? 3 : 2);
+    });
+    wav_worker.start();
+
+    // Audio Engine and ALSA device
+    looper::LooperEngine engine(to_engine_queue, from_engine_queue, save_queue, config);
     looper::AudioDevice audio_device(alsa_device, engine, config);
 
     std::cout << "[SYSTEM] Initializing audio device..." << std::endl;
     if (!audio_device.start()) {
         std::cerr << "[ERROR] Failed to start audio device on " << alsa_device << std::endl;
+        wav_worker.stop();
         return 1;
     }
     std::cout << "[SYSTEM] Audio engine started successfully!" << std::endl;
 
     float current_loop_gain = config.loop_gain;
-    float current_dry_gain = config.dry_gain;
 
     looper::InputManager input_manager([&](looper::ActionKey key) {
         switch (key) {
-            case looper::ActionKey::ACTION:
-                engine.triggerAction();
+            case looper::ActionKey::ACTION: {
+                looper::Command cmd;
+                cmd.type = looper::CommandType::ACTION;
+                to_engine_queue.push(std::move(cmd));
                 break;
-            case looper::ActionKey::STOP:
-                engine.triggerStop();
+            }
+            case looper::ActionKey::STOP: {
+                looper::Command cmd;
+                cmd.type = looper::CommandType::STOP;
+                to_engine_queue.push(std::move(cmd));
                 break;
-            case looper::ActionKey::CLEAR:
-                engine.triggerClear();
+            }
+            case looper::ActionKey::CLEAR: {
+                looper::Command cmd;
+                cmd.type = looper::CommandType::CLEAR;
+                to_engine_queue.push(std::move(cmd));
                 setInfoMessage("Loop cleared", 2);
                 break;
-            case looper::ActionKey::UNDO:
-                engine.triggerUndoRedo();
+            }
+            case looper::ActionKey::UNDO: {
+                looper::Command cmd;
+                cmd.type = looper::CommandType::UNDO_REDO;
+                to_engine_queue.push(std::move(cmd));
                 setInfoMessage("Undo / Redo triggered", 2);
                 break;
-            case looper::ActionKey::REVERSE:
-                engine.toggleReverse();
+            }
+            case looper::ActionKey::REVERSE: {
+                looper::Command cmd;
+                cmd.type = looper::CommandType::TOGGLE_REVERSE;
+                to_engine_queue.push(std::move(cmd));
                 break;
-            case looper::ActionKey::FADE:
-                engine.triggerFadeOut();
+            }
+            case looper::ActionKey::FADE: {
+                looper::Command cmd;
+                cmd.type = looper::CommandType::TRIGGER_FADE;
+                to_engine_queue.push(std::move(cmd));
                 break;
-            case looper::ActionKey::DRY_TOGGLE:
-                current_dry_gain = (current_dry_gain > 0.05f) ? 0.0f : 1.0f;
-                engine.setDryGain(current_dry_gain);
-                break;
-            case looper::ActionKey::SAVE_WAV: {
-                auto now = std::time(nullptr);
-                char buf[64];
-                std::strftime(buf, sizeof(buf), "loop-%Y%m%d-%H%M%S.wav", std::localtime(&now));
-                std::string path = "recordings/" + std::string(buf);
-                if (engine.saveToWav(path)) {
-                    setInfoMessage("Saved: " + path, 3);
+            }
+            case looper::ActionKey::TOGGLE_MONITOR: {
+                auto s = engine.getStatus();
+                auto next_mode = (s.monitor_mode == looper::MonitorMode::DIRECT_ANALOG)
+                                 ? looper::MonitorMode::SOFTWARE
+                                 : looper::MonitorMode::DIRECT_ANALOG;
+                looper::Command cmd;
+                cmd.type = looper::CommandType::SET_MONITOR_MODE;
+                cmd.int_param = static_cast<int>(next_mode);
+                to_engine_queue.push(std::move(cmd));
+                if (next_mode == looper::MonitorMode::DIRECT_ANALOG) {
+                    setInfoMessage("Monitor: DIRECT ANALOG (K=" + std::to_string(s.effective_latency_samples) + " smp, Dry: OFF)", 2);
                 } else {
-                    setInfoMessage("Save failed (empty loop?)", 2);
+                    setInfoMessage("Monitor: SOFTWARE DRY (K=0 smp, Dry: ON)", 2);
+                }
+                break;
+            }
+            case looper::ActionKey::SAVE_WAV: {
+                auto s = engine.getStatus();
+                if (s.total_frames == 0) {
+                    setInfoMessage("Cannot save: loop buffer is empty", 2);
+                } else {
+                    auto now = std::time(nullptr);
+                    char buf[64];
+                    std::strftime(buf, sizeof(buf), "loop-%Y%m%d-%H%M%S.wav", std::localtime(&now));
+                    std::string path = "recordings/" + std::string(buf);
+                    looper::Command cmd;
+                    cmd.type = looper::CommandType::REQUEST_SAVE_WAV;
+                    cmd.string_param = path;
+                    cmd.buffer_payload = std::make_shared<std::vector<float>>(s.total_frames);
+                    to_engine_queue.push(std::move(cmd));
+                    setInfoMessage("Saving snapshot: " + path, 2);
                 }
                 break;
             }
@@ -201,32 +255,50 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
-                if (!newest_file.empty() && engine.loadFromWav(newest_file)) {
-                    setInfoMessage("Loaded: " + newest_file, 3);
+                if (!newest_file.empty()) {
+                    setInfoMessage("Loading: " + newest_file + " ...", 2);
+                    wav_worker.requestLoad(newest_file, config.sample_rate);
                 } else {
-                    setInfoMessage("No WAV file found to load", 2);
+                    setInfoMessage("No WAV file found in recordings/", 2);
                 }
                 break;
             }
-            case looper::ActionKey::LATENCY_UP:
-                engine.adjustLatency(+32);
-                setInfoMessage("Latency: " + std::to_string(engine.getLatency()) + " smp", 1);
+            case looper::ActionKey::LATENCY_UP: {
+                looper::Command cmd;
+                cmd.type = looper::CommandType::ADJUST_LATENCY;
+                cmd.int_param = +32;
+                to_engine_queue.push(std::move(cmd));
+                setInfoMessage("Latency +32 smp", 1);
                 break;
-            case looper::ActionKey::LATENCY_DOWN:
-                engine.adjustLatency(-32);
-                setInfoMessage("Latency: " + std::to_string(engine.getLatency()) + " smp", 1);
+            }
+            case looper::ActionKey::LATENCY_DOWN: {
+                looper::Command cmd;
+                cmd.type = looper::CommandType::ADJUST_LATENCY;
+                cmd.int_param = -32;
+                to_engine_queue.push(std::move(cmd));
+                setInfoMessage("Latency -32 smp", 1);
                 break;
-            case looper::ActionKey::VOL_UP:
+            }
+            case looper::ActionKey::VOL_UP: {
                 current_loop_gain = std::min(2.0f, current_loop_gain + 0.05f);
-                engine.setLoopGain(current_loop_gain);
+                looper::Command cmd;
+                cmd.type = looper::CommandType::SET_LOOP_GAIN;
+                cmd.float_param = current_loop_gain;
+                to_engine_queue.push(std::move(cmd));
                 break;
-            case looper::ActionKey::VOL_DOWN:
+            }
+            case looper::ActionKey::VOL_DOWN: {
                 current_loop_gain = std::max(0.0f, current_loop_gain - 0.05f);
-                engine.setLoopGain(current_loop_gain);
+                looper::Command cmd;
+                cmd.type = looper::CommandType::SET_LOOP_GAIN;
+                cmd.float_param = current_loop_gain;
+                to_engine_queue.push(std::move(cmd));
                 break;
-            case looper::ActionKey::QUIT:
+            }
+            case looper::ActionKey::QUIT: {
                 g_running.store(false);
                 break;
+            }
             default:
                 break;
         }
@@ -236,13 +308,14 @@ int main(int argc, char* argv[]) {
     std::cout << "[SYSTEM] Input manager ready. Waiting for triggers...\n" << std::endl;
 
     while (g_running.load()) {
-        printStatus(engine.getStatus(), current_loop_gain, current_dry_gain);
+        printStatus(engine.getStatus(), current_loop_gain);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     std::cout << "\n\n[SYSTEM] Stopping audio engine..." << std::endl;
     input_manager.stop();
     audio_device.stop();
+    wav_worker.stop();
     std::cout << "[SYSTEM] Clean shutdown complete. Goodbye!" << std::endl;
 
     return 0;

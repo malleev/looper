@@ -11,8 +11,8 @@ constexpr uint32_t DEFAULT_PERIOD_SIZE = 128;   // ~2.67 ms buffer at 48kHz
 constexpr uint32_t DEFAULT_PERIODS = 4;       // 4 periods = 512 frames buffer (~10.67 ms) for rock-solid USB stability
 constexpr uint32_t DEFAULT_CHANNELS = 4;      // MiniFuse 1 requires 4 HW channels
 constexpr uint32_t CROSSFADE_SAMPLES = 240;   // 5 ms crossfade at 48kHz to prevent clicks
-constexpr uint32_t DEFAULT_LATENCY_COMPENSATION = 384; // 1 period capture (128) + 2 periods playback cushion (256) = 384 samples (~8.0 ms)
-constexpr uint32_t PRE_ROLL_SAMPLES = 512;    // Pre-record rolling buffer (~10.6 ms) to catch note attack
+constexpr uint32_t DEFAULT_DIRECT_LATENCY = 384; // Configured test default for MiniFuse 1 Direct Analog Monitoring
+constexpr uint32_t PRE_ROLL_SAMPLES = 256;    // Pre-record rolling buffer (~5.3 ms) to catch note attack
 
 enum class LooperState {
     IDLE,       // No loop recorded, passthrough live audio
@@ -20,6 +20,11 @@ enum class LooperState {
     PLAYING,    // Playing loop (+ passthrough live audio)
     OVERDUB,    // Recording new layer on top of loop (+ playing loop + passthrough)
     STOPPED     // Loop exists in memory, but playback is paused
+};
+
+enum class MonitorMode {
+    DIRECT_ANALOG, // Direct hardware monitoring on audio card. Software dry = 0, overdub compensation = K
+    SOFTWARE       // Software live monitoring via ALSA. Software dry = 1.0, overdub compensation = 0
 };
 
 inline const char* stateToString(LooperState state) {
@@ -33,26 +38,36 @@ inline const char* stateToString(LooperState state) {
     }
 }
 
+inline const char* monitorModeToString(MonitorMode mode) {
+    switch (mode) {
+        case MonitorMode::DIRECT_ANALOG: return "ANALOG_DIRECT";
+        case MonitorMode::SOFTWARE: return "SOFTWARE_DRY";
+        default: return "UNKNOWN";
+    }
+}
+
 struct LooperConfig {
     uint32_t sample_rate = DEFAULT_SAMPLE_RATE;
     uint32_t period_size = DEFAULT_PERIOD_SIZE;
-    float dry_gain = 1.0f;       // Direct monitoring on by default
+    MonitorMode monitor_mode = MonitorMode::DIRECT_ANALOG; // Default to direct analog for zero-latency playing
+    float dry_gain = 0.0f;       // 0.0 for DIRECT_ANALOG, 1.0 for SOFTWARE
     float loop_gain = 1.0f;      // Main loop playback volume
     float fade_out_sec = 3.0f;   // Fade-out duration in seconds
     uint32_t crossfade_samples = CROSSFADE_SAMPLES;
-    uint32_t latency_compensation = DEFAULT_LATENCY_COMPENSATION;
+    uint32_t latency_compensation = DEFAULT_DIRECT_LATENCY;
     uint32_t pre_roll = PRE_ROLL_SAMPLES;
 };
 
 struct LooperStatus {
     LooperState state = LooperState::IDLE;
+    MonitorMode monitor_mode = MonitorMode::DIRECT_ANALOG;
     size_t playhead_frames = 0;
     size_t total_frames = 0;
     float current_sec = 0.0f;
     float total_sec = 0.0f;
-    float in_peak = 0.0f;        // 0.0 to 1.0 peak input level
-    uint32_t latency_samples = DEFAULT_LATENCY_COMPENSATION;
-    float latency_ms = 8.0f;
+    float in_peak = 0.0f;
+    uint32_t effective_latency_samples = DEFAULT_DIRECT_LATENCY;
+    float effective_latency_ms = 8.0f;
     bool is_reversed = false;
     bool is_fading_out = false;
     bool undo_available = false;
