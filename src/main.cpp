@@ -17,6 +17,7 @@
 #include <ctime>
 #include <mutex>
 #include <filesystem>
+#include <fstream>
 #include <algorithm>
 #include <stdexcept>
 
@@ -153,6 +154,7 @@ int main(int argc, char* argv[]) {
     uint32_t pre_roll = looper::PRE_ROLL_SAMPLES;
     bool do_calibrate = false;
     uint32_t max_seconds = 60;
+    std::string storage_dir = "";
     auto number = [](const char* text) -> uint32_t {
         std::string value(text);
         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
@@ -172,6 +174,8 @@ int main(int argc, char* argv[]) {
             do_calibrate = true;
         } else if (arg == "--max-seconds" && i + 1 < argc) {
             max_seconds = number(argv[++i]);
+        } else if ((arg == "--recordings-dir" || arg == "--storage") && i + 1 < argc) {
+            storage_dir = argv[++i];
         } else if ((arg == "-c" || arg == "--capture") && i + 1 < argc) {
             capture_dev = argv[++i];
         } else if ((arg == "-p" || arg == "--playback") && i + 1 < argc) {
@@ -222,6 +226,24 @@ int main(int argc, char* argv[]) {
         playback_dev = capture_dev;
     }
 
+    if (storage_dir.empty()) {
+        // Auto-detect USB flash drive at /media/looper
+        if (fs::exists("/media/looper")) {
+            try {
+                std::string probe_path = "/media/looper/.probe_rw";
+                std::ofstream probe(probe_path);
+                if (probe.good()) {
+                    probe.close();
+                    fs::remove(probe_path);
+                    storage_dir = "/media/looper";
+                }
+            } catch (...) {}
+        }
+        if (storage_dir.empty()) {
+            storage_dir = "recordings";
+        }
+    }
+
     // Automated loopback latency calibration mode
     if (do_calibrate) {
         looper::AudioConfig cal_cfg;
@@ -259,13 +281,15 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
 
-    fs::create_directories("recordings");
+    fs::create_directories(storage_dir);
 
     std::cout << "=====================================================" << std::endl;
     std::cout << "   ORANGE PI GUITAR LOOPER (Version C - Full MVP)    " << std::endl;
     std::cout << "=====================================================" << std::endl;
     std::cout << "Capture:  " << capture_dev << " (channel " << cap_index << ")" << std::endl;
     std::cout << "Playback: " << playback_dev << std::endl;
+    std::cout << "Storage:  " << (storage_dir == "/media/looper" ? "[USB FLASH DRIVE] " : "[LOCAL SD] ")
+              << storage_dir << std::endl;
     std::cout << "\nControls:" << std::endl;
     std::cout << "  [SPACE]     : Rec -> Play -> Overdub -> Play" << std::endl;
     std::cout << "  [S]         : Stop playback" << std::endl;
@@ -441,17 +465,17 @@ int main(int argc, char* argv[]) {
                     char buf[64];
                     std::strftime(buf, sizeof(buf), "loop-%Y%m%d-%H%M%S", std::localtime(&now));
                     auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
-                    std::string path = "recordings/" + std::string(buf) + "-" + std::to_string(unique) + ".wav";
+                    std::string path = storage_dir + "/" + std::string(buf) + "-" + std::to_string(unique) + ".wav";
                     wav_worker.requestSave(path, s.total_frames, config.sample_rate);
-                    setInfoMessage("Saving snapshot: " + path, 2);
+                    setInfoMessage("Saving: " + path, 2);
                 }
                 break;
             }
             case looper::ActionKey::LOAD_WAV: {
                 std::string newest_file = "";
                 fs::file_time_type newest_time;
-                if (fs::exists("recordings")) {
-                    for (const auto& entry : fs::directory_iterator("recordings")) {
+                if (fs::exists(storage_dir)) {
+                    for (const auto& entry : fs::directory_iterator(storage_dir)) {
                         if (entry.is_regular_file() && entry.path().extension() == ".wav") {
                             auto t = fs::last_write_time(entry);
                             if (newest_file.empty() || t > newest_time) {
@@ -465,7 +489,7 @@ int main(int argc, char* argv[]) {
                     setInfoMessage("Loading: " + newest_file + " ...", 2);
                     wav_worker.requestLoad(newest_file, config.sample_rate);
                 } else {
-                    setInfoMessage("No WAV file found in recordings/", 2);
+                    setInfoMessage("No WAV file found in " + storage_dir, 2);
                 }
                 break;
             }
