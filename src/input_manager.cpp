@@ -25,11 +25,9 @@ void InputManager::scanEvdevDevices() {
         int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
 
-        // Check if device supports keys
         unsigned long ev_bits = 0;
         if (ioctl(fd, EVIOCGBIT(0, sizeof(ev_bits)), &ev_bits) >= 0) {
             if (ev_bits & (1 << EV_KEY)) {
-                // Check if device has SPACE key
                 uint8_t key_bits[(KEY_MAX + 7) / 8];
                 memset(key_bits, 0, sizeof(key_bits));
                 if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits) >= 0) {
@@ -73,7 +71,6 @@ void InputManager::stop() {
 }
 
 void InputManager::workerLoop() {
-    // Configure STDIN for non-canonical non-echo if available
     struct termios orig_termios;
     bool has_tty = isatty(STDIN_FILENO);
     if (has_tty) {
@@ -92,7 +89,6 @@ void InputManager::workerLoop() {
             struct pollfd p;
             p.fd = STDIN_FILENO;
             p.events = POLLIN;
-            p.revents = 0;
             p.revents = 0;
             pfd.push_back(p);
         }
@@ -123,6 +119,10 @@ void InputManager::workerLoop() {
                         case 'r': case 'R': ak = ActionKey::REVERSE; break;
                         case 'f': case 'F': ak = ActionKey::FADE; break;
                         case 'm': case 'M': ak = ActionKey::DRY_TOGGLE; break;
+                        case 'w': case 'W': ak = ActionKey::SAVE_WAV; break;
+                        case 'l': case 'L': ak = ActionKey::LOAD_WAV; break;
+                        case '>': case '.': ak = ActionKey::LATENCY_UP; break;
+                        case '<': case ',': ak = ActionKey::LATENCY_DOWN; break;
                         case '+': case '=': ak = ActionKey::VOL_UP; break;
                         case '-': case '_': ak = ActionKey::VOL_DOWN; break;
                         case 'q': case 'Q': ak = ActionKey::QUIT; break;
@@ -139,7 +139,7 @@ void InputManager::workerLoop() {
             if (pfd[idx].revents & POLLIN) {
                 struct input_event ev;
                 while (read(pfd[idx].fd, &ev, sizeof(ev)) == sizeof(ev)) {
-                    if (ev.type == EV_KEY && ev.value == 1) { // Key down event
+                    if (ev.type == EV_KEY && ev.value == 1) { // Key down
                         ActionKey ak = ActionKey::NONE;
                         switch (ev.code) {
                             case KEY_SPACE: ak = ActionKey::ACTION; break;
@@ -149,6 +149,10 @@ void InputManager::workerLoop() {
                             case KEY_R: ak = ActionKey::REVERSE; break;
                             case KEY_F: ak = ActionKey::FADE; break;
                             case KEY_M: ak = ActionKey::DRY_TOGGLE; break;
+                            case KEY_W: ak = ActionKey::SAVE_WAV; break;
+                            case KEY_L: ak = ActionKey::LOAD_WAV; break;
+                            case KEY_DOT: case KEY_RIGHT: ak = ActionKey::LATENCY_UP; break;
+                            case KEY_COMMA: case KEY_LEFT: ak = ActionKey::LATENCY_DOWN; break;
                             case KEY_EQUAL: case KEY_KPPLUS: ak = ActionKey::VOL_UP; break;
                             case KEY_MINUS: case KEY_KPMINUS: ak = ActionKey::VOL_DOWN; break;
                             case KEY_Q: case KEY_ESC: ak = ActionKey::QUIT; break;

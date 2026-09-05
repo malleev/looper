@@ -1,21 +1,26 @@
 #include "looper_engine.hpp"
+#include "wav_file.hpp"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 
 namespace looper {
 
 LooperEngine::LooperEngine(const LooperConfig& config)
-    : config_(config) {
+    : config_(config), latency_compensation_(config.latency_compensation) {
     base_track_.reserve(MAX_LOOP_FRAMES);
     overdub_layer_.reserve(MAX_LOOP_FRAMES);
     undo_backup_.reserve(MAX_LOOP_FRAMES);
+
+    pre_roll_buffer_.assign(config_.pre_roll, 0.0f);
 }
 
 void LooperEngine::process(const float* in, float* out_left, float* out_right, size_t nframes) {
     float dry_gain = config_.dry_gain;
     float loop_gain = config_.loop_gain;
     LooperState current_state = state_.load(std::memory_order_relaxed);
+    uint32_t K = latency_compensation_.load(std::memory_order_relaxed);
 
     float max_peak = 0.0f;
 
@@ -23,6 +28,10 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
         float in_sample = in[i];
         float abs_in = std::abs(in_sample);
         if (abs_in > max_peak) max_peak = abs_in;
+
+        // Continuously update circular pre-roll buffer
+        pre_roll_buffer_[pre_roll_idx_] = in_sample;
+        pre_roll_idx_ = (pre_roll_idx_ + 1) % pre_roll_buffer_.size();
 
         // Dry pass-through
         float left = in_sample * dry_gain;
@@ -58,10 +67,19 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
                 left += loop_sample;
                 right += loop_sample;
 
-                // Handle overdubbing
+                // Handle overdubbing with Latency Compensation (Overdub Alignment)
                 if (current_state == LooperState::OVERDUB) {
-                    if (read_idx < overdub_layer_.size()) {
-                        overdub_layer_[read_idx] += in_sample;
+                    // Shift incoming sample backwards by K samples to align with what musician heard
+                    size_t target_idx = 0;
+                    if (read_idx >= (K % loop_length_)) {
+                        target_idx = read_idx - (K % loop_length_);
+                    } else {
+                        target_idx = loop_length_ + read_idx - (K % loop_length_);
+                    }
+                    target_idx %= loop_length_;
+
+                    if (target_idx < overdub_layer_.size()) {
+                        overdub_layer_[target_idx] += in_sample;
                     }
                 }
 
@@ -84,6 +102,7 @@ void LooperEngine::triggerAction() {
 
     switch (current) {
         case LooperState::IDLE: {
+            // Start recording base loop with Pre-Roll to preserve leading transient
             base_track_.clear();
             overdub_layer_.clear();
             undo_backup_.clear();
@@ -92,6 +111,15 @@ void LooperEngine::triggerAction() {
             is_fading_out_.store(false, std::memory_order_relaxed);
             undo_available_.store(false, std::memory_order_relaxed);
             redo_available_.store(false, std::memory_order_relaxed);
+
+            // Pre-seed base track with pre-roll samples
+            size_t n = config_.pre_roll;
+            size_t buf_len = pre_roll_buffer_.size();
+            size_t start_pos = (pre_roll_idx_ + buf_len - n) % buf_len;
+            for (size_t i = 0; i < n; ++i) {
+                base_track_.push_back(pre_roll_buffer_[(start_pos + i) % buf_len]);
+            }
+
             state_.store(LooperState::RECORDING, std::memory_order_release);
             break;
         }
@@ -108,6 +136,7 @@ void LooperEngine::triggerAction() {
             break;
         }
         case LooperState::PLAYING: {
+            // Start overdubbing
             undo_backup_ = base_track_;
             undo_available_.store(true, std::memory_order_relaxed);
             redo_available_.store(false, std::memory_order_relaxed);
@@ -117,6 +146,7 @@ void LooperEngine::triggerAction() {
             break;
         }
         case LooperState::OVERDUB: {
+            // Commit overdub layer
             for (size_t i = 0; i < loop_length_; ++i) {
                 base_track_[i] = std::clamp(base_track_[i] + overdub_layer_[i], -1.0f, 1.0f);
             }
@@ -196,6 +226,40 @@ void LooperEngine::triggerFadeOut() {
     is_fading_out_.store(true, std::memory_order_relaxed);
 }
 
+void LooperEngine::adjustLatency(int delta_samples) {
+    int current = static_cast<int>(latency_compensation_.load(std::memory_order_relaxed));
+    int updated = std::clamp(current + delta_samples, 0, 48000);
+    latency_compensation_.store(static_cast<uint32_t>(updated), std::memory_order_relaxed);
+}
+
+bool LooperEngine::saveToWav(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    if (base_track_.empty()) {
+        std::cerr << "[LOOPER] Cannot save empty loop." << std::endl;
+        return false;
+    }
+    return WavFile::save(filepath, base_track_, config_.sample_rate);
+}
+
+bool LooperEngine::loadFromWav(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    std::vector<float> loaded;
+    uint32_t sr = 0;
+    if (!WavFile::load(filepath, loaded, sr)) {
+        return false;
+    }
+
+    base_track_ = std::move(loaded);
+    loop_length_ = base_track_.size();
+    playhead_ = 0;
+    overdub_layer_.assign(loop_length_, 0.0f);
+    undo_backup_.clear();
+    undo_available_.store(false, std::memory_order_relaxed);
+    redo_available_.store(false, std::memory_order_relaxed);
+    state_.store(LooperState::STOPPED, std::memory_order_release);
+    return true;
+}
+
 void LooperEngine::applyLoopSeamCrossfade() {
     size_t xfade_len = std::min(static_cast<size_t>(config_.crossfade_samples), loop_length_ / 2);
     if (xfade_len == 0) return;
@@ -219,6 +283,8 @@ LooperStatus LooperEngine::getStatus() const {
     s.current_sec = static_cast<float>(playhead_) / config_.sample_rate;
     s.total_sec = static_cast<float>(loop_length_) / config_.sample_rate;
     s.in_peak = in_peak_.load(std::memory_order_relaxed);
+    s.latency_samples = latency_compensation_.load(std::memory_order_relaxed);
+    s.latency_ms = (static_cast<float>(s.latency_samples) / config_.sample_rate) * 1000.0f;
     s.is_reversed = is_reversed_.load(std::memory_order_relaxed);
     s.is_fading_out = is_fading_out_.load(std::memory_order_relaxed);
     s.undo_available = undo_available_.load(std::memory_order_relaxed);

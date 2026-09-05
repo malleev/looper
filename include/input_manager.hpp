@@ -10,16 +10,20 @@ namespace looper {
 
 enum class ActionKey {
     NONE,
-    ACTION,     // Space
-    STOP,       // S
-    CLEAR,      // C
-    UNDO,       // U
-    REVERSE,    // R
-    FADE,       // F
-    DRY_TOGGLE, // M
-    VOL_UP,     // +
-    VOL_DOWN,   // -
-    QUIT        // Q
+    ACTION,        // Space
+    STOP,          // S
+    CLEAR,         // C
+    UNDO,          // U
+    REVERSE,       // R
+    FADE,          // F
+    DRY_TOGGLE,    // M
+    VOL_UP,        // +
+    VOL_DOWN,      // -
+    SAVE_WAV,      // W
+    LOAD_WAV,      // L
+    LATENCY_UP,    // > or .
+    LATENCY_DOWN,  // < or ,
+    QUIT           // Q
 };
 
 class InputManager {

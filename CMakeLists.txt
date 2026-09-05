@@ -17,6 +17,8 @@ set(SOURCES
     src/main.cpp
     src/audio_device.cpp
     src/looper_engine.cpp
+    src/input_manager.cpp
+    src/wav_file.cpp
 )
 
 add_executable(looper ${SOURCES})

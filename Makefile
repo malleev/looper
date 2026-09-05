@@ -3,7 +3,7 @@ CXXFLAGS ?= -std=c++17 -O3 -Wall -Wextra -pthread -Iinclude
 LDFLAGS ?= -lasound -lpthread
 
 TARGET = looper
-SRCS = src/main.cpp src/audio_device.cpp src/looper_engine.cpp src/input_manager.cpp
+SRCS = src/main.cpp src/audio_device.cpp src/looper_engine.cpp src/input_manager.cpp src/wav_file.cpp
 OBJS = $(SRCS:.cpp=.o)
 
 all: $(TARGET)

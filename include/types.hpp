@@ -7,10 +7,12 @@
 namespace looper {
 
 constexpr uint32_t DEFAULT_SAMPLE_RATE = 48000;
-constexpr uint32_t DEFAULT_PERIOD_SIZE = 128;   // ~2.6 ms buffer at 48kHz
-constexpr uint32_t DEFAULT_PERIODS = 4;       // 4 periods = 512 frames buffer (~10.6 ms) for rock-solid USB stability
+constexpr uint32_t DEFAULT_PERIOD_SIZE = 128;   // ~2.67 ms buffer at 48kHz
+constexpr uint32_t DEFAULT_PERIODS = 4;       // 4 periods = 512 frames buffer (~10.67 ms) for rock-solid USB stability
 constexpr uint32_t DEFAULT_CHANNELS = 4;      // MiniFuse 1 requires 4 HW channels
 constexpr uint32_t CROSSFADE_SAMPLES = 240;   // 5 ms crossfade at 48kHz to prevent clicks
+constexpr uint32_t DEFAULT_LATENCY_COMPENSATION = 384; // 1 period capture (128) + 2 periods playback cushion (256) = 384 samples (~8.0 ms)
+constexpr uint32_t PRE_ROLL_SAMPLES = 512;    // Pre-record rolling buffer (~10.6 ms) to catch note attack
 
 enum class LooperState {
     IDLE,       // No loop recorded, passthrough live audio
@@ -34,10 +36,12 @@ inline const char* stateToString(LooperState state) {
 struct LooperConfig {
     uint32_t sample_rate = DEFAULT_SAMPLE_RATE;
     uint32_t period_size = DEFAULT_PERIOD_SIZE;
-    float dry_gain = 1.0f;       // 1.0f enabled by default so you hear yourself in real time!
+    float dry_gain = 1.0f;       // Direct monitoring on by default
     float loop_gain = 1.0f;      // Main loop playback volume
     float fade_out_sec = 3.0f;   // Fade-out duration in seconds
     uint32_t crossfade_samples = CROSSFADE_SAMPLES;
+    uint32_t latency_compensation = DEFAULT_LATENCY_COMPENSATION;
+    uint32_t pre_roll = PRE_ROLL_SAMPLES;
 };
 
 struct LooperStatus {
@@ -46,7 +50,9 @@ struct LooperStatus {
     size_t total_frames = 0;
     float current_sec = 0.0f;
     float total_sec = 0.0f;
-    float in_peak = 0.0f;        // 0.0 to 1.0 peak input level for VU-meter
+    float in_peak = 0.0f;        // 0.0 to 1.0 peak input level
+    uint32_t latency_samples = DEFAULT_LATENCY_COMPENSATION;
+    float latency_ms = 8.0f;
     bool is_reversed = false;
     bool is_fading_out = false;
     bool undo_available = false;
