@@ -6,14 +6,18 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
-#include <functional>
 
 namespace looper {
 
 class LooperEngine {
 public:
-    LooperEngine(CommandQueue& cmd_queue, BufferReturnQueue& return_queue, SaveQueue& save_queue, const LooperConfig& config = LooperConfig());
-    ~LooperEngine() = default;
+    LooperEngine(ControlQueue& ctrl_queue,
+                 LoadQueue& load_queue,
+                 BufferReturnQueue& return_queue,
+                 SaveSlotQueue& save_slot_queue,
+                 SaveReadyQueue& save_ready_queue,
+                 const LooperConfig& config = LooperConfig());
+    ~LooperEngine();
 
     // REAL-TIME AUDIO PROCESSING (Runs strictly on real-time audio thread)
     void process(const float* in, float* out_left, float* out_right, size_t nframes);
@@ -26,9 +30,11 @@ private:
     void processPendingCommands();
     void applyLoopSeamCrossfade();
 
-    CommandQueue& cmd_queue_;
+    ControlQueue& ctrl_queue_;
+    LoadQueue& load_queue_;
     BufferReturnQueue& return_queue_;
-    SaveQueue& save_queue_;
+    SaveSlotQueue& save_slot_queue_;
+    SaveReadyQueue& save_ready_queue_;
 
     LooperConfig config_;
 
@@ -39,11 +45,15 @@ private:
     std::atomic<bool> redo_available_{false};
     std::atomic<float> in_peak_{0.0f};
     std::atomic<uint32_t> latency_compensation_{DEFAULT_DIRECT_LATENCY};
-    std::atomic<MonitorMode> monitor_mode_{MonitorMode::DIRECT_ANALOG};
+    std::atomic<MonitorMode> monitor_mode_{MonitorMode::SOFTWARE};
+
+    // Atomic status mirrors for UI to avoid data races
+    std::atomic<size_t> status_playhead_{0};
+    std::atomic<size_t> status_loop_length_{0};
 
     // Pre-allocated loop buffers (owned and accessed exclusively by real-time audio thread)
     static constexpr size_t MAX_LOOP_FRAMES = 48000 * 60 * 10; // 10 minutes max loop
-    std::vector<float> base_track_;
+    std::vector<float>* base_track_ptr_{nullptr};
     std::vector<float> current_overdub_;
     std::vector<float> last_overdub_;
     bool has_undo_layer_{false};

@@ -13,15 +13,18 @@
 #include <atomic>
 #include <cmath>
 #include <ctime>
+#include <mutex>
 #include <filesystem>
 
 namespace fs = std::filesystem;
 
 std::atomic<bool> g_running{true};
+std::mutex g_info_mutex;
 std::string g_info_message = "";
 std::chrono::steady_clock::time_point g_info_expire;
 
 void setInfoMessage(const std::string& msg, int display_sec = 3) {
+    std::lock_guard<std::mutex> lock(g_info_mutex);
     g_info_message = msg;
     g_info_expire = std::chrono::steady_clock::now() + std::chrono::seconds(display_sec);
 }
@@ -34,13 +37,21 @@ void printStatus(const looper::LooperStatus& status, float loop_gain) {
     std::cout << "\r\033[2K"; // Clear line
 
     // If there's an active notification message, show it
-    if (!g_info_message.empty()) {
-        if (std::chrono::steady_clock::now() < g_info_expire) {
-            std::cout << "\033[1;36m>>> " << g_info_message << " <<<\033[0m" << std::flush;
-            return;
-        } else {
-            g_info_message.clear();
+    std::string info_to_show = "";
+    {
+        std::lock_guard<std::mutex> lock(g_info_mutex);
+        if (!g_info_message.empty()) {
+            if (std::chrono::steady_clock::now() < g_info_expire) {
+                info_to_show = g_info_message;
+            } else {
+                g_info_message.clear();
+            }
         }
+    }
+
+    if (!info_to_show.empty()) {
+        std::cout << "\033[1;36m>>> " << info_to_show << " <<<\033[0m" << std::flush;
+        return;
     }
 
     // State Badge (7 chars)
@@ -134,26 +145,28 @@ int main(int argc, char* argv[]) {
     looper::LooperConfig config;
     config.sample_rate = 48000;
     config.period_size = 128; // ~2.67 ms buffer
-    config.monitor_mode = looper::MonitorMode::DIRECT_ANALOG; // Default to direct analog hardware monitoring
-    config.dry_gain = 1.0f;   // Software dry volume (used when monitor_mode is SOFTWARE)
+    config.monitor_mode = looper::MonitorMode::SOFTWARE; // Default to software monitoring for MiniFuse prototype
+    config.dry_gain = 1.0f;   // Direct dry passthrough enabled
     config.loop_gain = 1.0f;
     config.fade_out_sec = 3.0f;
-    config.latency_compensation = 384; // ~8.0 ms (1 capture period + 2 playback cushion periods)
+    config.latency_compensation = 384; // Test value for DIRECT_ANALOG mode
     config.pre_roll = 256;             // ~5.3 ms pre-roll to catch note attack
 
-    // Lock-free queues for thread communication
-    looper::CommandQueue to_engine_queue;
-    looper::BufferReturnQueue from_engine_queue;
-    looper::SaveQueue save_queue;
+    // Pure SPSC queues for thread-safe decoupled communication
+    looper::ControlQueue ctrl_queue;
+    looper::LoadQueue load_queue;
+    looper::BufferReturnQueue return_queue;
+    looper::SaveSlotQueue save_slot_queue;
+    looper::SaveReadyQueue save_ready_queue;
 
     // Background worker for non-blocking file I/O
-    looper::WavWorker wav_worker(to_engine_queue, from_engine_queue, save_queue, [](const std::string& msg, bool is_error) {
+    looper::WavWorker wav_worker(load_queue, return_queue, save_slot_queue, save_ready_queue, [](const std::string& msg, bool is_error) {
         setInfoMessage(msg, is_error ? 3 : 2);
     });
     wav_worker.start();
 
     // Audio Engine and ALSA device
-    looper::LooperEngine engine(to_engine_queue, from_engine_queue, save_queue, config);
+    looper::LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
     looper::AudioDevice audio_device(alsa_device, engine, config);
 
     std::cout << "[SYSTEM] Initializing audio device..." << std::endl;
@@ -169,41 +182,41 @@ int main(int argc, char* argv[]) {
     looper::InputManager input_manager([&](looper::ActionKey key) {
         switch (key) {
             case looper::ActionKey::ACTION: {
-                looper::Command cmd;
-                cmd.type = looper::CommandType::ACTION;
-                to_engine_queue.push(std::move(cmd));
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::ACTION;
+                ctrl_queue.push(cmd);
                 break;
             }
             case looper::ActionKey::STOP: {
-                looper::Command cmd;
-                cmd.type = looper::CommandType::STOP;
-                to_engine_queue.push(std::move(cmd));
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::STOP;
+                ctrl_queue.push(cmd);
                 break;
             }
             case looper::ActionKey::CLEAR: {
-                looper::Command cmd;
-                cmd.type = looper::CommandType::CLEAR;
-                to_engine_queue.push(std::move(cmd));
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::CLEAR;
+                ctrl_queue.push(cmd);
                 setInfoMessage("Loop cleared", 2);
                 break;
             }
             case looper::ActionKey::UNDO: {
-                looper::Command cmd;
-                cmd.type = looper::CommandType::UNDO_REDO;
-                to_engine_queue.push(std::move(cmd));
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::UNDO_REDO;
+                ctrl_queue.push(cmd);
                 setInfoMessage("Undo / Redo triggered", 2);
                 break;
             }
             case looper::ActionKey::REVERSE: {
-                looper::Command cmd;
-                cmd.type = looper::CommandType::TOGGLE_REVERSE;
-                to_engine_queue.push(std::move(cmd));
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::TOGGLE_REVERSE;
+                ctrl_queue.push(cmd);
                 break;
             }
             case looper::ActionKey::FADE: {
-                looper::Command cmd;
-                cmd.type = looper::CommandType::TRIGGER_FADE;
-                to_engine_queue.push(std::move(cmd));
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::TRIGGER_FADE;
+                ctrl_queue.push(cmd);
                 break;
             }
             case looper::ActionKey::TOGGLE_MONITOR: {
@@ -211,10 +224,10 @@ int main(int argc, char* argv[]) {
                 auto next_mode = (s.monitor_mode == looper::MonitorMode::DIRECT_ANALOG)
                                  ? looper::MonitorMode::SOFTWARE
                                  : looper::MonitorMode::DIRECT_ANALOG;
-                looper::Command cmd;
-                cmd.type = looper::CommandType::SET_MONITOR_MODE;
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::SET_MONITOR_MODE;
                 cmd.int_param = static_cast<int>(next_mode);
-                to_engine_queue.push(std::move(cmd));
+                ctrl_queue.push(cmd);
                 if (next_mode == looper::MonitorMode::DIRECT_ANALOG) {
                     setInfoMessage("Monitor: DIRECT ANALOG (K=" + std::to_string(s.effective_latency_samples) + " smp, Dry: OFF)", 2);
                 } else {
@@ -224,24 +237,21 @@ int main(int argc, char* argv[]) {
             }
             case looper::ActionKey::SAVE_WAV: {
                 auto s = engine.getStatus();
-                if (s.total_frames == 0) {
+                if (s.state != looper::LooperState::STOPPED) {
+                    setInfoMessage("Stop playback [S] before saving WAV", 3);
+                } else if (s.total_frames == 0) {
                     setInfoMessage("Cannot save: loop buffer is empty", 2);
                 } else {
                     auto now = std::time(nullptr);
                     char buf[64];
                     std::strftime(buf, sizeof(buf), "loop-%Y%m%d-%H%M%S.wav", std::localtime(&now));
                     std::string path = "recordings/" + std::string(buf);
-                    looper::Command cmd;
-                    cmd.type = looper::CommandType::REQUEST_SAVE_WAV;
-                    cmd.string_param = path;
-                    cmd.buffer_payload = std::make_shared<std::vector<float>>(s.total_frames);
-                    to_engine_queue.push(std::move(cmd));
+                    wav_worker.requestSave(path, s.total_frames, config.sample_rate);
                     setInfoMessage("Saving snapshot: " + path, 2);
                 }
                 break;
             }
             case looper::ActionKey::LOAD_WAV: {
-                // Find newest .wav file in recordings/
                 std::string newest_file = "";
                 fs::file_time_type newest_time;
                 if (fs::exists("recordings")) {
@@ -264,35 +274,35 @@ int main(int argc, char* argv[]) {
                 break;
             }
             case looper::ActionKey::LATENCY_UP: {
-                looper::Command cmd;
-                cmd.type = looper::CommandType::ADJUST_LATENCY;
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::ADJUST_LATENCY;
                 cmd.int_param = +32;
-                to_engine_queue.push(std::move(cmd));
+                ctrl_queue.push(cmd);
                 setInfoMessage("Latency +32 smp", 1);
                 break;
             }
             case looper::ActionKey::LATENCY_DOWN: {
-                looper::Command cmd;
-                cmd.type = looper::CommandType::ADJUST_LATENCY;
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::ADJUST_LATENCY;
                 cmd.int_param = -32;
-                to_engine_queue.push(std::move(cmd));
+                ctrl_queue.push(cmd);
                 setInfoMessage("Latency -32 smp", 1);
                 break;
             }
             case looper::ActionKey::VOL_UP: {
                 current_loop_gain = std::min(2.0f, current_loop_gain + 0.05f);
-                looper::Command cmd;
-                cmd.type = looper::CommandType::SET_LOOP_GAIN;
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::SET_LOOP_GAIN;
                 cmd.float_param = current_loop_gain;
-                to_engine_queue.push(std::move(cmd));
+                ctrl_queue.push(cmd);
                 break;
             }
             case looper::ActionKey::VOL_DOWN: {
                 current_loop_gain = std::max(0.0f, current_loop_gain - 0.05f);
-                looper::Command cmd;
-                cmd.type = looper::CommandType::SET_LOOP_GAIN;
+                looper::ControlCommand cmd;
+                cmd.type = looper::ControlCommandType::SET_LOOP_GAIN;
                 cmd.float_param = current_loop_gain;
-                to_engine_queue.push(std::move(cmd));
+                ctrl_queue.push(cmd);
                 break;
             }
             case looper::ActionKey::QUIT: {

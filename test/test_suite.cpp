@@ -10,11 +10,12 @@
 #include <thread>
 #include <vector>
 #include <fstream>
+#include <atomic>
 
 using namespace looper;
 
 void test_spsc_queue() {
-    std::cout << "[TEST] SpscQueue concurrency... " << std::flush;
+    std::cout << "[TEST] SpscQueue concurrency (50k items)... " << std::flush;
     SpscQueue<int, 128> queue;
     constexpr int COUNT = 50000;
 
@@ -82,9 +83,11 @@ void test_wav_sample_rate_validation() {
 void test_engine_state_and_undo_redo() {
     std::cout << "[TEST] Engine State Machine, Headroom & Undo/Redo... " << std::flush;
 
-    CommandQueue cmd_queue;
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
     BufferReturnQueue return_queue;
-    SaveQueue save_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
 
     LooperConfig config;
     config.sample_rate = 48000;
@@ -96,21 +99,21 @@ void test_engine_state_and_undo_redo() {
     config.crossfade_samples = 0; // Disable crossfade for exact sample checks
     config.latency_compensation = 0; // Test basic overdub mixing without shift
 
-    LooperEngine engine(cmd_queue, return_queue, save_queue, config);
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
 
     constexpr size_t BLOCK = 128;
     std::vector<float> in(BLOCK, 0.5f);
     std::vector<float> out_l(BLOCK, 0.0f);
     std::vector<float> out_r(BLOCK, 0.0f);
 
-    auto push_cmd = [&](CommandType type) {
-        Command cmd;
+    auto push_cmd = [&](ControlCommandType type) {
+        ControlCommand cmd;
         cmd.type = type;
-        cmd_queue.push(std::move(cmd));
+        ctrl_queue.push(cmd);
     };
 
     // 1. Trigger ACTION -> Start Recording
-    push_cmd(CommandType::ACTION);
+    push_cmd(ControlCommandType::ACTION);
     engine.process(in.data(), out_l.data(), out_r.data(), BLOCK);
     assert(engine.getStatus().state == LooperState::RECORDING);
 
@@ -119,7 +122,7 @@ void test_engine_state_and_undo_redo() {
     // Total recorded = 256 samples of 0.5f
 
     // 2. Trigger ACTION -> End Recording, Enter PLAYING
-    push_cmd(CommandType::ACTION);
+    push_cmd(ControlCommandType::ACTION);
     std::fill(in.begin(), in.end(), 0.0f); // Zero input during playback
     engine.process(in.data(), out_l.data(), out_r.data(), BLOCK);
     assert(engine.getStatus().state == LooperState::PLAYING);
@@ -131,7 +134,7 @@ void test_engine_state_and_undo_redo() {
     }
 
     // 3. Trigger ACTION -> Enter OVERDUB
-    push_cmd(CommandType::ACTION);
+    push_cmd(ControlCommandType::ACTION);
     // Overdub input = 0.3f
     std::fill(in.begin(), in.end(), 0.3f);
     engine.process(in.data(), out_l.data(), out_r.data(), BLOCK);
@@ -141,7 +144,7 @@ void test_engine_state_and_undo_redo() {
     engine.process(in.data(), out_l.data(), out_r.data(), BLOCK);
 
     // 4. Trigger ACTION -> End Overdub, return to PLAYING
-    push_cmd(CommandType::ACTION);
+    push_cmd(ControlCommandType::ACTION);
     std::fill(in.begin(), in.end(), 0.0f);
     engine.process(in.data(), out_l.data(), out_r.data(), BLOCK);
     assert(engine.getStatus().state == LooperState::PLAYING);
@@ -153,7 +156,7 @@ void test_engine_state_and_undo_redo() {
     }
 
     // 5. Test UNDO
-    push_cmd(CommandType::UNDO_REDO);
+    push_cmd(ControlCommandType::UNDO_REDO);
     engine.process(in.data(), out_l.data(), out_r.data(), BLOCK);
     assert(engine.getStatus().undo_available == false);
     assert(engine.getStatus().redo_available == true);
@@ -164,7 +167,7 @@ void test_engine_state_and_undo_redo() {
     }
 
     // 6. Test REDO
-    push_cmd(CommandType::UNDO_REDO);
+    push_cmd(ControlCommandType::UNDO_REDO);
     engine.process(in.data(), out_l.data(), out_r.data(), BLOCK);
     assert(engine.getStatus().undo_available == true);
     assert(engine.getStatus().redo_available == false);
@@ -177,28 +180,76 @@ void test_engine_state_and_undo_redo() {
     std::cout << "PASSED!" << std::endl;
 }
 
+void test_concurrent_get_status() {
+    std::cout << "[TEST] Concurrent getStatus() thread-safety... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::atomic<bool> done{false};
+    constexpr int BLOCKS = 2000;
+
+    // Audio thread: process blocks and update playhead
+    std::thread audio_thread([&]() {
+        float in[128] = {0.1f};
+        float out_l[128] = {0};
+        float out_r[128] = {0};
+
+        ControlCommand cmd;
+        cmd.type = ControlCommandType::ACTION;
+        ctrl_queue.push(cmd);
+
+        for (int i = 0; i < BLOCKS; ++i) {
+            engine.process(in, out_l, out_r, 128);
+        }
+        done.store(true);
+    });
+
+    // UI thread: hammer getStatus() concurrently
+    std::thread ui_thread([&]() {
+        while (!done.load(std::memory_order_relaxed)) {
+            LooperStatus s = engine.getStatus();
+            (void)s.playhead_frames;
+            (void)s.total_frames;
+            (void)s.state;
+        }
+    });
+
+    audio_thread.join();
+    ui_thread.join();
+    std::cout << "PASSED!" << std::endl;
+}
+
 void test_monitor_mode_and_latency() {
     std::cout << "[TEST] MonitorMode & Latency Compensation Logic... " << std::flush;
 
-    CommandQueue cmd_queue;
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
     BufferReturnQueue return_queue;
-    SaveQueue save_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
 
     LooperConfig config;
     config.monitor_mode = MonitorMode::DIRECT_ANALOG;
     config.latency_compensation = 384;
 
-    LooperEngine engine(cmd_queue, return_queue, save_queue, config);
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
 
     auto status = engine.getStatus();
     assert(status.monitor_mode == MonitorMode::DIRECT_ANALOG);
     assert(status.effective_latency_samples == 384);
 
     // Switch to SOFTWARE monitoring mode
-    Command cmd;
-    cmd.type = CommandType::SET_MONITOR_MODE;
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::SET_MONITOR_MODE;
     cmd.int_param = static_cast<int>(MonitorMode::SOFTWARE);
-    cmd_queue.push(std::move(cmd));
+    ctrl_queue.push(cmd);
 
     float in[128] = {0};
     float out_l[128] = {0};
@@ -220,8 +271,10 @@ int main() {
     test_spsc_queue();
     test_wav_sample_rate_validation();
     test_engine_state_and_undo_redo();
+    test_concurrent_get_status();
     test_monitor_mode_and_latency();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (4/4)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (5/5)" << std::endl;
     return 0;
 }
+

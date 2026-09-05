@@ -6,19 +6,37 @@
 
 namespace looper {
 
-LooperEngine::LooperEngine(CommandQueue& cmd_queue, BufferReturnQueue& return_queue, SaveQueue& save_queue, const LooperConfig& config)
-    : cmd_queue_(cmd_queue), return_queue_(return_queue), save_queue_(save_queue), config_(config),
+LooperEngine::LooperEngine(ControlQueue& ctrl_queue,
+                           LoadQueue& load_queue,
+                           BufferReturnQueue& return_queue,
+                           SaveSlotQueue& save_slot_queue,
+                           SaveReadyQueue& save_ready_queue,
+                           const LooperConfig& config)
+    : ctrl_queue_(ctrl_queue),
+      load_queue_(load_queue),
+      return_queue_(return_queue),
+      save_slot_queue_(save_slot_queue),
+      save_ready_queue_(save_ready_queue),
+      config_(config),
       latency_compensation_(config.latency_compensation),
       monitor_mode_(config.monitor_mode) {
-    base_track_.reserve(MAX_LOOP_FRAMES);
+    base_track_ptr_ = new std::vector<float>();
+    base_track_ptr_->reserve(MAX_LOOP_FRAMES);
     current_overdub_.reserve(MAX_LOOP_FRAMES);
     last_overdub_.reserve(MAX_LOOP_FRAMES);
 
-    pre_roll_buffer_.assign(config_.pre_roll, 0.0f);
+    if (config_.pre_roll > 0) {
+        pre_roll_buffer_.assign(config_.pre_roll, 0.0f);
+    }
+}
+
+LooperEngine::~LooperEngine() {
+    delete base_track_ptr_;
+    base_track_ptr_ = nullptr;
 }
 
 void LooperEngine::process(const float* in, float* out_left, float* out_right, size_t nframes) {
-    // 1. Process all pending control commands at the start of audio block (block boundary)
+    // 1. Process all pending control, load, and save-slot commands at the start of audio block (block boundary)
     processPendingCommands();
 
     MonitorMode mode = monitor_mode_.load(std::memory_order_relaxed);
@@ -49,8 +67,8 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
         float right = in_sample * dry_gain;
 
         if (current_state == LooperState::RECORDING) {
-            if (base_track_.size() < MAX_LOOP_FRAMES) {
-                base_track_.push_back(in_sample);
+            if (base_track_ptr_->size() < MAX_LOOP_FRAMES) {
+                base_track_ptr_->push_back(in_sample);
             }
         } else if (current_state == LooperState::PLAYING || current_state == LooperState::OVERDUB) {
             if (loop_length_ > 0) {
@@ -59,9 +77,9 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
                                     ? (loop_length_ - 1 - playhead_) 
                                     : playhead_;
 
-                float loop_sample = base_track_[read_idx];
+                float loop_sample = (*base_track_ptr_)[read_idx];
 
-                // FEATURE 6: In OVERDUB, immediately hear previously recorded overdub audio!
+                // In OVERDUB, immediately hear previously recorded overdub audio!
                 if (current_state == LooperState::OVERDUB && read_idx < current_overdub_.size()) {
                     loop_sample += current_overdub_[read_idx];
                 }
@@ -116,18 +134,23 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     }
 
     in_peak_.store(max_peak, std::memory_order_relaxed);
+
+    // Atomically publish status for UI thread (eliminates getStatus data race)
+    status_playhead_.store(playhead_, std::memory_order_relaxed);
+    status_loop_length_.store(loop_length_, std::memory_order_relaxed);
 }
 
 void LooperEngine::processPendingCommands() {
-    Command cmd;
-    while (cmd_queue_.pop(cmd)) {
+    // 1. Process control commands from UI / InputManager
+    ControlCommand cmd;
+    while (ctrl_queue_.pop(cmd)) {
         switch (cmd.type) {
-            case CommandType::ACTION: {
+            case ControlCommandType::ACTION: {
                 LooperState current = state_.load(std::memory_order_relaxed);
                 switch (current) {
                     case LooperState::IDLE: {
                         // Start recording base loop with pre-roll
-                        base_track_.clear();
+                        base_track_ptr_->clear();
                         current_overdub_.clear();
                         last_overdub_.clear();
                         loop_length_ = 0;
@@ -144,7 +167,7 @@ void LooperEngine::processPendingCommands() {
                             size_t n = std::min(static_cast<size_t>(config_.pre_roll), buf_len);
                             size_t start_pos = (pre_roll_idx_ + buf_len - n) % buf_len;
                             for (size_t i = 0; i < n; ++i) {
-                                base_track_.push_back(pre_roll_buffer_[(start_pos + i) % buf_len]);
+                                base_track_ptr_->push_back(pre_roll_buffer_[(start_pos + i) % buf_len]);
                             }
                         }
 
@@ -152,11 +175,12 @@ void LooperEngine::processPendingCommands() {
                         break;
                     }
                     case LooperState::RECORDING: {
-                        if (!base_track_.empty()) {
-                            loop_length_ = base_track_.size();
+                        if (!base_track_ptr_->empty()) {
+                            loop_length_ = base_track_ptr_->size();
                             applyLoopSeamCrossfade();
                             playhead_ = 0;
-                            current_overdub_.assign(loop_length_, 0.0f);
+                            current_overdub_.resize(loop_length_);
+                            std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
                             state_.store(LooperState::PLAYING, std::memory_order_release);
                         } else {
                             state_.store(LooperState::IDLE, std::memory_order_release);
@@ -165,17 +189,21 @@ void LooperEngine::processPendingCommands() {
                     }
                     case LooperState::PLAYING: {
                         // Start overdub
-                        current_overdub_.assign(loop_length_, 0.0f);
+                        current_overdub_.resize(loop_length_);
+                        std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
                         state_.store(LooperState::OVERDUB, std::memory_order_release);
                         break;
                     }
                     case LooperState::OVERDUB: {
                         // Commit overdub: additive into base_track without destructive clamp!
                         for (size_t i = 0; i < loop_length_; ++i) {
-                            base_track_[i] += current_overdub_[i];
+                            (*base_track_ptr_)[i] += current_overdub_[i];
                         }
-                        last_overdub_ = std::move(current_overdub_);
-                        current_overdub_.assign(loop_length_, 0.0f);
+                        // Zero-allocation swap preserving capacity
+                        last_overdub_.swap(current_overdub_);
+                        current_overdub_.resize(loop_length_);
+                        std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
+
                         has_undo_layer_ = true;
                         is_undone_ = false;
                         undo_available_.store(true, std::memory_order_relaxed);
@@ -190,14 +218,16 @@ void LooperEngine::processPendingCommands() {
                         }
                         break;
                     }
+                    default:
+                        break;
                 }
                 break;
             }
-            case CommandType::STOP: {
+            case ControlCommandType::STOP: {
                 LooperState current = state_.load(std::memory_order_relaxed);
                 if (current == LooperState::RECORDING) {
-                    if (!base_track_.empty()) {
-                        loop_length_ = base_track_.size();
+                    if (!base_track_ptr_->empty()) {
+                        loop_length_ = base_track_ptr_->size();
                         applyLoopSeamCrossfade();
                         playhead_ = 0;
                         state_.store(LooperState::STOPPED, std::memory_order_release);
@@ -206,10 +236,12 @@ void LooperEngine::processPendingCommands() {
                     }
                 } else if (current == LooperState::OVERDUB) {
                     for (size_t i = 0; i < loop_length_; ++i) {
-                        base_track_[i] += current_overdub_[i];
+                        (*base_track_ptr_)[i] += current_overdub_[i];
                     }
-                    last_overdub_ = std::move(current_overdub_);
-                    current_overdub_.assign(loop_length_, 0.0f);
+                    last_overdub_.swap(current_overdub_);
+                    current_overdub_.resize(loop_length_);
+                    std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
+
                     has_undo_layer_ = true;
                     is_undone_ = false;
                     undo_available_.store(true, std::memory_order_relaxed);
@@ -221,9 +253,9 @@ void LooperEngine::processPendingCommands() {
                 is_fading_out_.store(false, std::memory_order_relaxed);
                 break;
             }
-            case CommandType::CLEAR: {
+            case ControlCommandType::CLEAR: {
                 state_.store(LooperState::IDLE, std::memory_order_release);
-                base_track_.clear();
+                base_track_ptr_->clear();
                 current_overdub_.clear();
                 last_overdub_.clear();
                 loop_length_ = 0;
@@ -235,13 +267,13 @@ void LooperEngine::processPendingCommands() {
                 redo_available_.store(false, std::memory_order_relaxed);
                 break;
             }
-            case CommandType::UNDO_REDO: {
+            case ControlCommandType::UNDO_REDO: {
                 if (!has_undo_layer_ || loop_length_ == 0 || last_overdub_.size() != loop_length_) break;
 
                 if (!is_undone_) {
                     // Non-destructive exact float subtraction!
                     for (size_t i = 0; i < loop_length_; ++i) {
-                        base_track_[i] -= last_overdub_[i];
+                        (*base_track_ptr_)[i] -= last_overdub_[i];
                     }
                     is_undone_ = true;
                     undo_available_.store(false, std::memory_order_relaxed);
@@ -249,7 +281,7 @@ void LooperEngine::processPendingCommands() {
                 } else {
                     // Redo
                     for (size_t i = 0; i < loop_length_; ++i) {
-                        base_track_[i] += last_overdub_[i];
+                        (*base_track_ptr_)[i] += last_overdub_[i];
                     }
                     is_undone_ = false;
                     undo_available_.store(true, std::memory_order_relaxed);
@@ -257,12 +289,12 @@ void LooperEngine::processPendingCommands() {
                 }
                 break;
             }
-            case CommandType::TOGGLE_REVERSE: {
+            case ControlCommandType::TOGGLE_REVERSE: {
                 bool rev = is_reversed_.load(std::memory_order_relaxed);
                 is_reversed_.store(!rev, std::memory_order_relaxed);
                 break;
             }
-            case CommandType::TRIGGER_FADE: {
+            case ControlCommandType::TRIGGER_FADE: {
                 LooperState current = state_.load(std::memory_order_relaxed);
                 if (current == LooperState::PLAYING || current == LooperState::OVERDUB) {
                     fade_out_total_frames_ = static_cast<size_t>(config_.fade_out_sec * config_.sample_rate);
@@ -271,65 +303,72 @@ void LooperEngine::processPendingCommands() {
                 }
                 break;
             }
-            case CommandType::SET_MONITOR_MODE: {
+            case ControlCommandType::SET_MONITOR_MODE: {
                 auto new_mode = static_cast<MonitorMode>(cmd.int_param);
                 monitor_mode_.store(new_mode, std::memory_order_relaxed);
                 break;
             }
-            case CommandType::ADJUST_LATENCY: {
+            case ControlCommandType::ADJUST_LATENCY: {
                 int current = static_cast<int>(latency_compensation_.load(std::memory_order_relaxed));
                 int updated = std::clamp(current + cmd.int_param, 0, 48000);
                 latency_compensation_.store(static_cast<uint32_t>(updated), std::memory_order_relaxed);
                 break;
             }
-            case CommandType::SET_LOOP_GAIN: {
+            case ControlCommandType::SET_LOOP_GAIN: {
                 config_.loop_gain = std::max(0.0f, cmd.float_param);
                 break;
             }
-            case CommandType::SET_DRY_GAIN: {
+            case ControlCommandType::SET_DRY_GAIN: {
                 config_.dry_gain = std::clamp(cmd.float_param, 0.0f, 1.0f);
                 break;
             }
-            case CommandType::LOAD_LOOP_READY: {
-                if (cmd.buffer_payload && !cmd.buffer_payload->empty()) {
-                    // Safely swap buffers!
-                    auto old_buf = std::make_shared<std::vector<float>>();
-                    base_track_.swap(*old_buf);
-                    // Pass old buffer back to worker thread for asynchronous deallocation
-                    return_queue_.push(old_buf);
+            default:
+                break;
+        }
+    }
 
-                    base_track_ = std::move(*cmd.buffer_payload);
-                    loop_length_ = base_track_.size();
-                    playhead_ = 0;
-                    current_overdub_.assign(loop_length_, 0.0f);
-                    last_overdub_.clear();
-                    has_undo_layer_ = false;
-                    is_undone_ = false;
-                    undo_available_.store(false, std::memory_order_relaxed);
-                    redo_available_.store(false, std::memory_order_relaxed);
-                    state_.store(LooperState::STOPPED, std::memory_order_release);
-                }
-                break;
-            }
-            case CommandType::REQUEST_SAVE_WAV: {
-                if (!base_track_.empty() && cmd.buffer_payload) {
-                    if (cmd.buffer_payload->size() >= base_track_.size()) {
-                        std::copy(base_track_.begin(), base_track_.end(), cmd.buffer_payload->begin());
-                        cmd.buffer_payload->resize(base_track_.size());
-                        SaveRequest req;
-                        req.filepath = std::move(cmd.string_param);
-                        req.buffer = std::move(cmd.buffer_payload);
-                        req.sample_rate = config_.sample_rate;
-                        save_queue_.push(std::move(req));
-                    }
-                }
-                break;
+    // 2. Process Load commands from WavWorker (pointer swap, 0 malloc/free in audio thread)
+    LoadCommand load_cmd;
+    while (load_queue_.pop(load_cmd)) {
+        if (load_cmd.buffer) {
+            std::vector<float>* old_buf = base_track_ptr_;
+            base_track_ptr_ = load_cmd.buffer;
+            return_queue_.push(old_buf); // Old buffer reclaimed by WavWorker
+
+            loop_length_ = base_track_ptr_->size();
+            playhead_ = 0;
+            current_overdub_.resize(loop_length_);
+            std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
+            last_overdub_.clear();
+            has_undo_layer_ = false;
+            is_undone_ = false;
+            undo_available_.store(false, std::memory_order_relaxed);
+            redo_available_.store(false, std::memory_order_relaxed);
+            state_.store(LooperState::STOPPED, std::memory_order_release);
+        }
+    }
+
+    // 3. Process Save snapshot slot commands from WavWorker
+    SaveSlotCommand slot_cmd;
+    while (save_slot_queue_.pop(slot_cmd)) {
+        if (slot_cmd.buffer) {
+            LooperState current = state_.load(std::memory_order_relaxed);
+            // Allow save snapshot only when STOPPED and loop exists
+            if (current == LooperState::STOPPED && base_track_ptr_ && !base_track_ptr_->empty()) {
+                slot_cmd.buffer->resize(base_track_ptr_->size());
+                std::copy(base_track_ptr_->begin(), base_track_ptr_->end(), slot_cmd.buffer->begin());
+                save_ready_queue_.push(slot_cmd.buffer);
+            } else {
+                // Not stopped or empty loop: signal failure with empty buffer
+                slot_cmd.buffer->clear();
+                save_ready_queue_.push(slot_cmd.buffer);
             }
         }
     }
 }
 
 void LooperEngine::applyLoopSeamCrossfade() {
+    if (!base_track_ptr_ || loop_length_ < 2) return;
     size_t xfade_len = std::min(static_cast<size_t>(config_.crossfade_samples), loop_length_ / 2);
     if (xfade_len == 0) return;
 
@@ -337,10 +376,10 @@ void LooperEngine::applyLoopSeamCrossfade() {
 
     for (size_t i = 0; i < xfade_len; ++i) {
         float alpha = static_cast<float>(i) / static_cast<float>(xfade_len);
-        float start_sample = base_track_[i];
-        float end_sample = base_track_[end_start + i];
+        float start_sample = (*base_track_ptr_)[i];
+        float end_sample = (*base_track_ptr_)[end_start + i];
 
-        base_track_[i] = (start_sample * alpha) + (end_sample * (1.0f - alpha));
+        (*base_track_ptr_)[i] = (start_sample * alpha) + (end_sample * (1.0f - alpha));
     }
 }
 
@@ -348,10 +387,10 @@ LooperStatus LooperEngine::getStatus() const {
     LooperStatus s;
     s.state = state_.load(std::memory_order_relaxed);
     s.monitor_mode = monitor_mode_.load(std::memory_order_relaxed);
-    s.playhead_frames = playhead_;
-    s.total_frames = loop_length_;
-    s.current_sec = static_cast<float>(playhead_) / config_.sample_rate;
-    s.total_sec = static_cast<float>(loop_length_) / config_.sample_rate;
+    s.playhead_frames = status_playhead_.load(std::memory_order_relaxed);
+    s.total_frames = status_loop_length_.load(std::memory_order_relaxed);
+    s.current_sec = static_cast<float>(s.playhead_frames) / config_.sample_rate;
+    s.total_sec = static_cast<float>(s.total_frames) / config_.sample_rate;
     s.in_peak = in_peak_.load(std::memory_order_relaxed);
 
     // Report effective latency based on monitor mode

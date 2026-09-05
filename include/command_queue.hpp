@@ -2,32 +2,38 @@
 
 #include <atomic>
 #include <vector>
-#include <memory>
-#include <string>
+#include <cstdint>
+#include <cstddef>
+#include <utility>
 
 namespace looper {
 
-enum class CommandType {
-    ACTION,             // Rec -> Play -> Overdub -> Play
-    STOP,               // Stop playback
-    CLEAR,              // Clear loop
-    UNDO_REDO,          // Toggle Undo/Redo
-    TOGGLE_REVERSE,     // Reverse playback
-    TRIGGER_FADE,       // Start fade-out
-    SET_MONITOR_MODE,   // Toggle or set MonitorMode (DIRECT_ANALOG vs SOFTWARE)
-    ADJUST_LATENCY,     // Adjust latency compensation (+/- delta)
-    SET_LOOP_GAIN,      // Adjust playback volume
-    SET_DRY_GAIN,       // Adjust software dry volume
-    LOAD_LOOP_READY,    // New loop loaded from disk by background worker
-    REQUEST_SAVE_WAV    // Request snapshot save to disk
+enum class ControlCommandType : uint8_t {
+    NONE = 0,
+    ACTION,
+    STOP,
+    CLEAR,
+    UNDO_REDO,
+    TOGGLE_REVERSE,
+    TRIGGER_FADE,
+    SET_MONITOR_MODE,
+    ADJUST_LATENCY,
+    SET_LOOP_GAIN,
+    SET_DRY_GAIN
 };
 
-struct Command {
-    CommandType type = CommandType::ACTION;
-    int int_param = 0;
+struct ControlCommand {
+    ControlCommandType type = ControlCommandType::NONE;
+    int32_t int_param = 0;
     float float_param = 0.0f;
-    std::shared_ptr<std::vector<float>> buffer_payload;
-    std::string string_param;
+};
+
+struct LoadCommand {
+    std::vector<float>* buffer = nullptr;
+};
+
+struct SaveSlotCommand {
+    std::vector<float>* buffer = nullptr;
 };
 
 // Fixed-size wait-free Single-Producer Single-Consumer queue
@@ -78,14 +84,10 @@ private:
     std::atomic<size_t> tail_;
 };
 
-struct SaveRequest {
-    std::string filepath;
-    std::shared_ptr<std::vector<float>> buffer;
-    uint32_t sample_rate = 48000;
-};
-
-using CommandQueue = SpscQueue<Command, 64>;
-using BufferReturnQueue = SpscQueue<std::shared_ptr<std::vector<float>>, 64>;
-using SaveQueue = SpscQueue<SaveRequest, 16>;
+using ControlQueue = SpscQueue<ControlCommand, 64>;
+using LoadQueue = SpscQueue<LoadCommand, 4>;
+using BufferReturnQueue = SpscQueue<std::vector<float>*, 4>;
+using SaveSlotQueue = SpscQueue<SaveSlotCommand, 4>;
+using SaveReadyQueue = SpscQueue<std::vector<float>*, 4>;
 
 } // namespace looper
