@@ -4,9 +4,13 @@ bin/
 obj/
 looper
 looper_tests
+looper_regressions
 test_looper
 test_asan
+test_buttons*
+hardware-smoke-*/
 *.o
+*.d
 *.a
 *.so
 

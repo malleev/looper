@@ -39,6 +39,7 @@ set(COMMON_SOURCES
     src/audio_device.cpp
     src/looper_engine.cpp
     src/input_manager.cpp
+    src/gpio_manager.cpp
     src/wav_file.cpp
     src/wav_worker.cpp
     src/latency_calibrator.cpp
@@ -46,6 +47,12 @@ set(COMMON_SOURCES
 
 add_executable(looper src/main.cpp ${COMMON_SOURCES})
 target_link_libraries(looper PRIVATE ${ALSA_LIBRARIES} Threads::Threads)
+
+find_library(GPIOD_LIB gpiod)
+if(GPIOD_LIB)
+    message(STATUS "Found libgpiod: ${GPIOD_LIB}")
+    target_link_libraries(looper PRIVATE ${GPIOD_LIB})
+endif()
 
 # Unit & regression tests executable
 add_executable(looper_tests

@@ -3,6 +3,7 @@
 #include "looper_engine.hpp"
 #include "audio_device.hpp"
 #include "input_manager.hpp"
+#include "gpio_manager.hpp"
 #include "wav_worker.hpp"
 #include "latency_calibrator.hpp"
 
@@ -359,7 +360,7 @@ int main(int argc, char* argv[]) {
 
     std::atomic<float> current_loop_gain{config.loop_gain};
 
-    looper::InputManager input_manager([&](looper::ActionKey key, uint64_t ts_ns) {
+    auto handleActionKey = [&](looper::ActionKey key, uint64_t ts_ns) {
         switch (key) {
             case looper::ActionKey::ACTION: {
                 looper::ControlCommand cmd;
@@ -517,10 +518,14 @@ int main(int argc, char* argv[]) {
             default:
                 break;
         }
-    });
+    };
+
+    looper::InputManager input_manager(handleActionKey);
+    looper::GpioManager gpio_manager(handleActionKey);
 
     input_manager.start();
-    std::cout << "[SYSTEM] Input manager ready. Waiting for triggers...\n" << std::endl;
+    gpio_manager.start();
+    std::cout << "[SYSTEM] Input managers ready. Waiting for triggers...\n" << std::endl;
 
     bool fatal_error = false;
     while (g_running.load()) {
@@ -535,12 +540,15 @@ int main(int argc, char* argv[]) {
             fatal_error = true;
             break;
         }
-        printStatus(engine.getStatus(), current_loop_gain.load(std::memory_order_relaxed), audio_device.getTelemetrySnapshot());
+        auto status = engine.getStatus();
+        printStatus(status, current_loop_gain.load(std::memory_order_relaxed), audio_device.getTelemetrySnapshot());
+        gpio_manager.updateStatus(status);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     std::cout << "\n\n[SYSTEM] Stopping audio engine..." << std::endl;
     input_manager.stop();
+    gpio_manager.stop();
     audio_device.stop();
     wav_worker.stop();
     std::cout << "[SYSTEM] Clean shutdown complete. Goodbye!" << std::endl;
