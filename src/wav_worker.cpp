@@ -87,37 +87,44 @@ void WavWorker::workerLoop() {
             if (task.is_save) {
                 if (task.loop_length == 0) {
                     if (callback_) callback_("Cannot save: loop is empty", true);
+                } else if (task.loop_length > MAX_LOOP_FRAMES) {
+                    if (callback_) callback_("Cannot save: loop exceeds max frames", true);
                 } else {
                     // Allocate staging buffer on worker thread
-                    auto* save_buf = new std::vector<float>(task.loop_length);
+                    auto* save_buf = new std::vector<float>();
+                    save_buf->reserve(task.loop_length);
+                    save_buf->resize(task.loop_length);
+
                     SaveSlotCommand slot;
                     slot.buffer = save_buf;
-                    save_slot_queue_.push(slot);
-
-                    // Wait for audio thread to copy snapshot (with 2-second timeout)
-                    auto start_wait = std::chrono::steady_clock::now();
-                    std::vector<float>* ready_buf = nullptr;
-                    while (running_.load()) {
-                        if (save_ready_queue_.pop(ready_buf)) {
-                            break;
-                        }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        if (std::chrono::steady_clock::now() - start_wait > std::chrono::seconds(2)) {
-                            break;
-                        }
-                    }
-
-                    if (ready_buf && !ready_buf->empty()) {
-                        if (WavFile::save(task.filepath, *ready_buf, task.sample_rate)) {
-                            if (callback_) callback_("Saved: " + task.filepath, false);
-                        } else {
-                            if (callback_) callback_("Failed to save: " + task.filepath, true);
-                        }
-                        delete ready_buf;
+                    if (!save_slot_queue_.push(slot)) {
+                        delete save_buf; // Clean up immediately if queue is full
+                        if (callback_) callback_("Save failed: engine queue full", true);
                     } else {
-                        if (callback_) callback_("Save failed (playback not stopped?)", true);
-                        if (ready_buf) delete ready_buf;
-                        else delete save_buf;
+                        // Ownership transferred to engine.
+                        // Strict ownership: worker MUST wait for engine to return buffer via save_ready_queue_!
+                        // Worker NEVER deletes save_buf directly on timeout to prevent UAF.
+                        std::vector<float>* ready_buf = nullptr;
+                        while (running_.load()) {
+                            if (save_ready_queue_.pop(ready_buf)) {
+                                break;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        }
+
+                        if (ready_buf && !ready_buf->empty()) {
+                            if (WavFile::save(task.filepath, *ready_buf, task.sample_rate)) {
+                                if (callback_) callback_("Saved: " + task.filepath, false);
+                            } else {
+                                if (callback_) callback_("Failed to save: " + task.filepath, true);
+                            }
+                            delete ready_buf;
+                        } else {
+                            if (callback_) callback_("Save failed (playback active or buffer empty)", true);
+                            if (ready_buf) {
+                                delete ready_buf;
+                            }
+                        }
                     }
                 }
             } else {
@@ -125,20 +132,36 @@ void WavWorker::workerLoop() {
                 std::vector<float> loaded;
                 std::string err;
                 if (WavFile::load(task.filepath, loaded, task.sample_rate, err)) {
-                    auto* new_buf = new std::vector<float>();
-                    constexpr size_t MAX_LOOP_FRAMES = 48000 * 60 * 10;
-                    new_buf->reserve(MAX_LOOP_FRAMES);
-                    new_buf->assign(loaded.begin(), loaded.end());
+                    if (loaded.size() > MAX_LOOP_FRAMES) {
+                        if (callback_) callback_("Load error: WAV file exceeds 10 min max", true);
+                    } else {
+                        auto* new_buf = new std::vector<float>();
+                        new_buf->reserve(MAX_LOOP_FRAMES);
+                        new_buf->assign(loaded.begin(), loaded.end());
 
-                    LoadCommand cmd;
-                    cmd.buffer = new_buf;
-                    load_queue_.push(cmd);
-                    if (callback_) callback_("Loaded: " + task.filepath, false);
+                        LoadCommand cmd;
+                        cmd.buffer = new_buf;
+                        if (!load_queue_.push(cmd)) {
+                            delete new_buf; // Clean up on push failure
+                            if (callback_) callback_("Load error: engine load queue full", true);
+                        } else {
+                            if (callback_) callback_("Loaded: " + task.filepath, false);
+                        }
+                    }
                 } else {
                     if (callback_) callback_("Load error: " + err, true);
                 }
             }
         }
+    }
+
+    // Drain and delete any leftover buffers on shutdown
+    std::vector<float>* leftover = nullptr;
+    while (return_queue_.pop(leftover)) {
+        delete leftover;
+    }
+    while (save_ready_queue_.pop(leftover)) {
+        delete leftover;
     }
 }
 

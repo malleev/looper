@@ -86,8 +86,8 @@ private:
 
 using ControlQueue = SpscQueue<ControlCommand, 64>;
 using LoadQueue = SpscQueue<LoadCommand, 4>;
-using BufferReturnQueue = SpscQueue<std::vector<float>*, 4>;
-using SaveSlotQueue = SpscQueue<SaveSlotCommand, 4>;
-using SaveReadyQueue = SpscQueue<std::vector<float>*, 4>;
+using BufferReturnQueue = SpscQueue<std::vector<float>*, 16>;
+using SaveSlotQueue = SpscQueue<SaveSlotCommand, 8>;
+using SaveReadyQueue = SpscQueue<std::vector<float>*, 8>;
 
 } // namespace looper

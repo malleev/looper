@@ -1,4 +1,5 @@
 #include "wav_file.hpp"
+#include "types.hpp"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
@@ -119,6 +120,11 @@ bool WavFile::load(const std::string& filepath, std::vector<float>& out_samples,
 
             if (bits_per_sample == 16) {
                 size_t num_samples = chunk_size / (channels * sizeof(int16_t));
+                if (num_samples > MAX_LOOP_FRAMES) {
+                    error_msg = "WAV file too long (" + std::to_string(num_samples) +
+                                " frames, max allowed is " + std::to_string(MAX_LOOP_FRAMES) + ")";
+                    return false;
+                }
                 out_samples.resize(num_samples);
                 std::vector<int16_t> raw_buf(channels);
                 for (size_t i = 0; i < num_samples; ++i) {
@@ -127,6 +133,11 @@ bool WavFile::load(const std::string& filepath, std::vector<float>& out_samples,
                 }
             } else if (bits_per_sample == 24) {
                 size_t num_samples = chunk_size / (channels * 3);
+                if (num_samples > MAX_LOOP_FRAMES) {
+                    error_msg = "WAV file too long (" + std::to_string(num_samples) +
+                                " frames, max allowed is " + std::to_string(MAX_LOOP_FRAMES) + ")";
+                    return false;
+                }
                 out_samples.resize(num_samples);
                 std::vector<uint8_t> raw_buf(channels * 3);
                 for (size_t i = 0; i < num_samples; ++i) {

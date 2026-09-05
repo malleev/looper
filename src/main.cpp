@@ -177,34 +177,40 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "[SYSTEM] Audio engine started successfully!" << std::endl;
 
-    float current_loop_gain = config.loop_gain;
+    std::atomic<float> current_loop_gain{config.loop_gain};
 
     looper::InputManager input_manager([&](looper::ActionKey key) {
         switch (key) {
             case looper::ActionKey::ACTION: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::ACTION;
-                ctrl_queue.push(cmd);
+                if (!ctrl_queue.push(cmd)) {
+                    setInfoMessage("Error: command queue full", 2);
+                }
                 break;
             }
             case looper::ActionKey::STOP: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::STOP;
-                ctrl_queue.push(cmd);
+                if (!ctrl_queue.push(cmd)) {
+                    setInfoMessage("Error: command queue full", 2);
+                }
                 break;
             }
             case looper::ActionKey::CLEAR: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::CLEAR;
-                ctrl_queue.push(cmd);
-                setInfoMessage("Loop cleared", 2);
+                if (ctrl_queue.push(cmd)) {
+                    setInfoMessage("Loop cleared", 2);
+                }
                 break;
             }
             case looper::ActionKey::UNDO: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::UNDO_REDO;
-                ctrl_queue.push(cmd);
-                setInfoMessage("Undo / Redo triggered", 2);
+                if (ctrl_queue.push(cmd)) {
+                    setInfoMessage("Undo / Redo triggered", 2);
+                }
                 break;
             }
             case looper::ActionKey::REVERSE: {
@@ -227,11 +233,12 @@ int main(int argc, char* argv[]) {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::SET_MONITOR_MODE;
                 cmd.int_param = static_cast<int>(next_mode);
-                ctrl_queue.push(cmd);
-                if (next_mode == looper::MonitorMode::DIRECT_ANALOG) {
-                    setInfoMessage("Monitor: DIRECT ANALOG (K=" + std::to_string(s.effective_latency_samples) + " smp, Dry: OFF)", 2);
-                } else {
-                    setInfoMessage("Monitor: SOFTWARE DRY (K=0 smp, Dry: ON)", 2);
+                if (ctrl_queue.push(cmd)) {
+                    if (next_mode == looper::MonitorMode::DIRECT_ANALOG) {
+                        setInfoMessage("Monitor: DIRECT ANALOG (K=" + std::to_string(s.configured_latency_samples) + " smp, Dry: OFF)", 2);
+                    } else {
+                        setInfoMessage("Monitor: SOFTWARE DRY (K=0 smp, Dry: ON)", 2);
+                    }
                 }
                 break;
             }
@@ -277,31 +284,37 @@ int main(int argc, char* argv[]) {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::ADJUST_LATENCY;
                 cmd.int_param = +32;
-                ctrl_queue.push(cmd);
-                setInfoMessage("Latency +32 smp", 1);
+                if (ctrl_queue.push(cmd)) {
+                    setInfoMessage("Latency +32 smp", 1);
+                }
                 break;
             }
             case looper::ActionKey::LATENCY_DOWN: {
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::ADJUST_LATENCY;
                 cmd.int_param = -32;
-                ctrl_queue.push(cmd);
-                setInfoMessage("Latency -32 smp", 1);
+                if (ctrl_queue.push(cmd)) {
+                    setInfoMessage("Latency -32 smp", 1);
+                }
                 break;
             }
             case looper::ActionKey::VOL_UP: {
-                current_loop_gain = std::min(2.0f, current_loop_gain + 0.05f);
+                float cur = current_loop_gain.load(std::memory_order_relaxed);
+                float updated = std::min(2.0f, cur + 0.05f);
+                current_loop_gain.store(updated, std::memory_order_relaxed);
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::SET_LOOP_GAIN;
-                cmd.float_param = current_loop_gain;
+                cmd.float_param = updated;
                 ctrl_queue.push(cmd);
                 break;
             }
             case looper::ActionKey::VOL_DOWN: {
-                current_loop_gain = std::max(0.0f, current_loop_gain - 0.05f);
+                float cur = current_loop_gain.load(std::memory_order_relaxed);
+                float updated = std::max(0.0f, cur - 0.05f);
+                current_loop_gain.store(updated, std::memory_order_relaxed);
                 looper::ControlCommand cmd;
                 cmd.type = looper::ControlCommandType::SET_LOOP_GAIN;
-                cmd.float_param = current_loop_gain;
+                cmd.float_param = updated;
                 ctrl_queue.push(cmd);
                 break;
             }
@@ -318,7 +331,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[SYSTEM] Input manager ready. Waiting for triggers...\n" << std::endl;
 
     while (g_running.load()) {
-        printStatus(engine.getStatus(), current_loop_gain);
+        printStatus(engine.getStatus(), current_loop_gain.load(std::memory_order_relaxed));
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 

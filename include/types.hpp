@@ -13,6 +13,7 @@ constexpr uint32_t DEFAULT_CHANNELS = 4;      // MiniFuse 1 requires 4 HW channe
 constexpr uint32_t CROSSFADE_SAMPLES = 240;   // 5 ms crossfade at 48kHz to prevent clicks
 constexpr uint32_t DEFAULT_DIRECT_LATENCY = 384; // Configured test default for MiniFuse 1 Direct Analog Monitoring
 constexpr uint32_t PRE_ROLL_SAMPLES = 256;    // Pre-record rolling buffer (~5.3 ms) to catch note attack
+constexpr size_t MAX_LOOP_FRAMES = 48000 * 60 * 10; // 10 minutes max loop buffer
 
 enum class LooperState {
     IDLE,       // No loop recorded, passthrough live audio
@@ -66,8 +67,10 @@ struct LooperStatus {
     float current_sec = 0.0f;
     float total_sec = 0.0f;
     float in_peak = 0.0f;
+    uint32_t configured_latency_samples = DEFAULT_DIRECT_LATENCY;
     uint32_t effective_latency_samples = DEFAULT_DIRECT_LATENCY;
     float effective_latency_ms = 8.0f;
+    float loop_gain = 1.0f;
     bool is_reversed = false;
     bool is_fading_out = false;
     bool undo_available = false;

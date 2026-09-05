@@ -263,6 +263,122 @@ void test_monitor_mode_and_latency() {
     std::cout << "PASSED!" << std::endl;
 }
 
+void test_preroll_length_compensation() {
+    std::cout << "[TEST] Pre-Roll Musical Length Compensation... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 256; // 256 samples pre-roll
+    config.crossfade_samples = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.2f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // 1. Start Recording
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128); // Block 1
+
+    // Record 15 more blocks = 16 blocks total = 16 * 128 = 2048 frames played
+    for (int b = 1; b < 16; ++b) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+
+    // 2. Stop Recording / Enter PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+
+    auto status = engine.getStatus();
+    assert(status.state == LooperState::PLAYING);
+    // Despite 256 frames of pre-roll at start, loop length should match the exact 2048 musical frames recorded!
+    assert(status.total_frames == 2048);
+
+    std::cout << "PASSED!" << std::endl;
+}
+
+void test_zero_on_transition_timing() {
+    std::cout << "[TEST] Zero O(N) Transition Execution Timing... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+    config.latency_compensation = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.1f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+
+    // Record a 500,000 samples loop (~10.4 seconds)
+    constexpr size_t TOTAL_BLOCKS = 500000 / 128;
+    for (size_t b = 0; b < TOTAL_BLOCKS; ++b) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+
+    // Enter PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // Enter OVERDUB
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::OVERDUB);
+
+    // Measure time to transition OVERDUB -> PLAYING (must be O(1), < 2000 microseconds)
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(elapsed_us < 2000);
+
+    // Measure UNDO time (must be O(1))
+    cmd.type = ControlCommandType::UNDO_REDO;
+    ctrl_queue.push(cmd);
+
+    t0 = std::chrono::high_resolution_clock::now();
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    t1 = std::chrono::high_resolution_clock::now();
+
+    elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    assert(engine.getStatus().undo_available == false);
+    assert(elapsed_us < 2000);
+
+    std::cout << "PASSED!" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  RUNNING LOOPER ENGINE UNIT TESTS      " << std::endl;
@@ -273,8 +389,10 @@ int main() {
     test_engine_state_and_undo_redo();
     test_concurrent_get_status();
     test_monitor_mode_and_latency();
+    test_preroll_length_compensation();
+    test_zero_on_transition_timing();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (5/5)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (7/7)" << std::endl;
     return 0;
 }
 

@@ -22,8 +22,7 @@ LooperEngine::LooperEngine(ControlQueue& ctrl_queue,
       monitor_mode_(config.monitor_mode) {
     base_track_ptr_ = new std::vector<float>();
     base_track_ptr_->reserve(MAX_LOOP_FRAMES);
-    current_overdub_.reserve(MAX_LOOP_FRAMES);
-    last_overdub_.reserve(MAX_LOOP_FRAMES);
+    last_layer_.reserve(MAX_LOOP_FRAMES);
 
     if (config_.pre_roll > 0) {
         pre_roll_buffer_.assign(config_.pre_roll, 0.0f);
@@ -33,11 +32,51 @@ LooperEngine::LooperEngine(ControlQueue& ctrl_queue,
 LooperEngine::~LooperEngine() {
     delete base_track_ptr_;
     base_track_ptr_ = nullptr;
+    delete overflow_return_buf_;
+    overflow_return_buf_ = nullptr;
 }
 
 void LooperEngine::process(const float* in, float* out_left, float* out_right, size_t nframes) {
-    // 1. Process all pending control, load, and save-slot commands at the start of audio block (block boundary)
+    // 1. Process pending control, load, and save-slot commands at audio block boundary
     processPendingCommands();
+
+    // 2. Advance background chunked WAV save if active (strictly bounded: 4096 samples / ~3us)
+    if (active_save_buf_) {
+        if (save_copy_total_ == 0) {
+            if (save_ready_queue_.push(active_save_buf_)) {
+                active_save_buf_ = nullptr;
+            }
+        } else {
+            size_t chunk = std::min(SAVE_CHUNK_SIZE, save_copy_total_ - save_copy_progress_);
+            std::copy(base_track_ptr_->begin() + save_copy_progress_,
+                      base_track_ptr_->begin() + save_copy_progress_ + chunk,
+                      active_save_buf_->begin() + save_copy_progress_);
+            save_copy_progress_ += chunk;
+            if (save_copy_progress_ >= save_copy_total_) {
+                if (save_ready_queue_.push(active_save_buf_)) {
+                    active_save_buf_ = nullptr;
+                }
+            }
+        }
+    }
+
+    // 3. Advance background chunked layer merge if active (strictly bounded: 512 samples / ~1us)
+    if (pending_merge_active_ && loop_length_ > 0) {
+        constexpr size_t MERGE_CHUNK_SIZE = 512;
+        size_t chunk = std::min(MERGE_CHUNK_SIZE, pending_merge_frames_);
+        for (size_t c = 0; c < chunk; ++c) {
+            size_t idx = pending_merge_idx_ % loop_length_;
+            if (idx < base_track_ptr_->size() && idx < last_layer_.size()) {
+                (*base_track_ptr_)[idx] += last_layer_[idx];
+                last_layer_[idx] = 0.0f;
+            }
+            pending_merge_idx_++;
+        }
+        pending_merge_frames_ -= chunk;
+        if (pending_merge_frames_ == 0) {
+            pending_merge_active_ = false;
+        }
+    }
 
     MonitorMode mode = monitor_mode_.load(std::memory_order_relaxed);
     float dry_gain = (mode == MonitorMode::SOFTWARE) ? config_.dry_gain : 0.0f;
@@ -45,8 +84,8 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     LooperState current_state = state_.load(std::memory_order_relaxed);
 
     // Overdub latency compensation:
-    // DIRECT_ANALOG mode: musician plays in time with dry sound, so overdub must be shifted back by K samples.
-    // SOFTWARE mode: musician already hears delayed monitor and plays to it, so compensation is 0!
+    // DIRECT_ANALOG mode: musician plays in time with dry sound, so overdub is shifted back by K samples.
+    // SOFTWARE mode: musician already hears delayed software monitor and plays to it, so compensation is 0!
     uint32_t K = (mode == MonitorMode::DIRECT_ANALOG) ? latency_compensation_.load(std::memory_order_relaxed) : 0;
 
     float max_peak = 0.0f;
@@ -69,6 +108,7 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
         if (current_state == LooperState::RECORDING) {
             if (base_track_ptr_->size() < MAX_LOOP_FRAMES) {
                 base_track_ptr_->push_back(in_sample);
+                last_layer_.push_back(0.0f);
             }
         } else if (current_state == LooperState::PLAYING || current_state == LooperState::OVERDUB) {
             if (loop_length_ > 0) {
@@ -77,11 +117,12 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
                                     ? (loop_length_ - 1 - playhead_) 
                                     : playhead_;
 
-                float loop_sample = (*base_track_ptr_)[read_idx];
-
-                // In OVERDUB, immediately hear previously recorded overdub audio!
-                if (current_state == LooperState::OVERDUB && read_idx < current_overdub_.size()) {
-                    loop_sample += current_overdub_[read_idx];
+                float loop_sample = 0.0f;
+                if (read_idx < base_track_ptr_->size()) {
+                    loop_sample = (*base_track_ptr_)[read_idx];
+                }
+                if (!is_undone_ && read_idx < last_layer_.size()) {
+                    loop_sample += last_layer_[read_idx];
                 }
 
                 // Handle fade-out
@@ -102,9 +143,8 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
                 left += loop_sample;
                 right += loop_sample;
 
-                // Handle Overdub record with Transport-Domain Latency Compensation
+                // Handle Overdub with Transport-Domain Latency Compensation (strictly incremental O(1))
                 if (current_state == LooperState::OVERDUB) {
-                    // 1. Shift backwards in transport time
                     size_t comp_playhead = 0;
                     if (playhead_ >= (K % loop_length_)) {
                         comp_playhead = playhead_ - (K % loop_length_);
@@ -113,13 +153,23 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
                     }
                     comp_playhead %= loop_length_;
 
-                    // 2. Map compensated transport time to memory index (handles reverse cleanly!)
                     size_t target_idx = is_reversed_.load(std::memory_order_relaxed)
                                           ? (loop_length_ - 1 - comp_playhead)
                                           : comp_playhead;
 
-                    if (target_idx < current_overdub_.size()) {
-                        current_overdub_[target_idx] += in_sample;
+                    if (target_idx < loop_length_ && target_idx < base_track_ptr_->size() && target_idx < last_layer_.size()) {
+                        if (overdub_frames_recorded_ < loop_length_) {
+                            // First pass over target_idx during this overdub session:
+                            // Commit previous overdub sample into base (unless it was undone)
+                            if (!is_undone_) {
+                                (*base_track_ptr_)[target_idx] += last_layer_[target_idx];
+                            }
+                            last_layer_[target_idx] = in_sample;
+                        } else {
+                            // Subsequent wrap-around in the same overdub session: accumulate into current layer
+                            last_layer_[target_idx] += in_sample;
+                        }
+                        overdub_frames_recorded_++;
                     }
                 }
 
@@ -151,23 +201,25 @@ void LooperEngine::processPendingCommands() {
                     case LooperState::IDLE: {
                         // Start recording base loop with pre-roll
                         base_track_ptr_->clear();
-                        current_overdub_.clear();
-                        last_overdub_.clear();
+                        last_layer_.clear();
                         loop_length_ = 0;
                         playhead_ = 0;
                         has_undo_layer_ = false;
                         is_undone_ = false;
+                        overdub_frames_recorded_ = 0;
+                        pending_merge_active_ = false;
                         is_fading_out_.store(false, std::memory_order_relaxed);
                         undo_available_.store(false, std::memory_order_relaxed);
                         redo_available_.store(false, std::memory_order_relaxed);
 
-                        // Copy pre-roll samples to catch initial transient attack
+                        // Pre-roll rolling buffer: capture note attack transient
                         if (!pre_roll_buffer_.empty() && config_.pre_roll > 0) {
                             size_t buf_len = pre_roll_buffer_.size();
                             size_t n = std::min(static_cast<size_t>(config_.pre_roll), buf_len);
                             size_t start_pos = (pre_roll_idx_ + buf_len - n) % buf_len;
                             for (size_t i = 0; i < n; ++i) {
                                 base_track_ptr_->push_back(pre_roll_buffer_[(start_pos + i) % buf_len]);
+                                last_layer_.push_back(0.0f);
                             }
                         }
 
@@ -176,11 +228,17 @@ void LooperEngine::processPendingCommands() {
                     }
                     case LooperState::RECORDING: {
                         if (!base_track_ptr_->empty()) {
+                            // Musical length compensation: trim pre_roll from end so loop duration
+                            // matches the exact musical rhythm between button presses!
+                            if (config_.pre_roll > 0 && base_track_ptr_->size() > config_.pre_roll) {
+                                base_track_ptr_->resize(base_track_ptr_->size() - config_.pre_roll);
+                                last_layer_.resize(base_track_ptr_->size());
+                            }
                             loop_length_ = base_track_ptr_->size();
                             applyLoopSeamCrossfade();
                             playhead_ = 0;
-                            current_overdub_.resize(loop_length_);
-                            std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
+                            overdub_frames_recorded_ = 0;
+                            pending_merge_active_ = false;
                             state_.store(LooperState::PLAYING, std::memory_order_release);
                         } else {
                             state_.store(LooperState::IDLE, std::memory_order_release);
@@ -188,21 +246,21 @@ void LooperEngine::processPendingCommands() {
                         break;
                     }
                     case LooperState::PLAYING: {
-                        // Start overdub
-                        current_overdub_.resize(loop_length_);
-                        std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
+                        // Start overdub (strictly O(1))
+                        overdub_frames_recorded_ = 0;
+                        pending_merge_active_ = false;
                         state_.store(LooperState::OVERDUB, std::memory_order_release);
                         break;
                     }
                     case LooperState::OVERDUB: {
-                        // Commit overdub: additive into base_track without destructive clamp!
-                        for (size_t i = 0; i < loop_length_; ++i) {
-                            (*base_track_ptr_)[i] += current_overdub_[i];
+                        // Transition OVERDUB -> PLAYING (strictly O(1) - NO bulk vector loops!)
+                        if (overdub_frames_recorded_ < loop_length_) {
+                            pending_merge_active_ = true;
+                            pending_merge_idx_ = playhead_;
+                            pending_merge_frames_ = loop_length_ - overdub_frames_recorded_;
+                        } else {
+                            pending_merge_active_ = false;
                         }
-                        // Zero-allocation swap preserving capacity
-                        last_overdub_.swap(current_overdub_);
-                        current_overdub_.resize(loop_length_);
-                        std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
 
                         has_undo_layer_ = true;
                         is_undone_ = false;
@@ -227,20 +285,27 @@ void LooperEngine::processPendingCommands() {
                 LooperState current = state_.load(std::memory_order_relaxed);
                 if (current == LooperState::RECORDING) {
                     if (!base_track_ptr_->empty()) {
+                        if (config_.pre_roll > 0 && base_track_ptr_->size() > config_.pre_roll) {
+                            base_track_ptr_->resize(base_track_ptr_->size() - config_.pre_roll);
+                            last_layer_.resize(base_track_ptr_->size());
+                        }
                         loop_length_ = base_track_ptr_->size();
                         applyLoopSeamCrossfade();
                         playhead_ = 0;
+                        overdub_frames_recorded_ = 0;
+                        pending_merge_active_ = false;
                         state_.store(LooperState::STOPPED, std::memory_order_release);
                     } else {
                         state_.store(LooperState::IDLE, std::memory_order_release);
                     }
                 } else if (current == LooperState::OVERDUB) {
-                    for (size_t i = 0; i < loop_length_; ++i) {
-                        (*base_track_ptr_)[i] += current_overdub_[i];
+                    if (overdub_frames_recorded_ < loop_length_) {
+                        pending_merge_active_ = true;
+                        pending_merge_idx_ = playhead_;
+                        pending_merge_frames_ = loop_length_ - overdub_frames_recorded_;
+                    } else {
+                        pending_merge_active_ = false;
                     }
-                    last_overdub_.swap(current_overdub_);
-                    current_overdub_.resize(loop_length_);
-                    std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
 
                     has_undo_layer_ = true;
                     is_undone_ = false;
@@ -256,33 +321,27 @@ void LooperEngine::processPendingCommands() {
             case ControlCommandType::CLEAR: {
                 state_.store(LooperState::IDLE, std::memory_order_release);
                 base_track_ptr_->clear();
-                current_overdub_.clear();
-                last_overdub_.clear();
+                last_layer_.clear();
                 loop_length_ = 0;
                 playhead_ = 0;
                 has_undo_layer_ = false;
                 is_undone_ = false;
+                overdub_frames_recorded_ = 0;
+                pending_merge_active_ = false;
                 is_fading_out_.store(false, std::memory_order_relaxed);
                 undo_available_.store(false, std::memory_order_relaxed);
                 redo_available_.store(false, std::memory_order_relaxed);
                 break;
             }
             case ControlCommandType::UNDO_REDO: {
-                if (!has_undo_layer_ || loop_length_ == 0 || last_overdub_.size() != loop_length_) break;
+                // Strictly O(1): instant layer toggle without traversing buffers!
+                if (!has_undo_layer_ || loop_length_ == 0) break;
 
                 if (!is_undone_) {
-                    // Non-destructive exact float subtraction!
-                    for (size_t i = 0; i < loop_length_; ++i) {
-                        (*base_track_ptr_)[i] -= last_overdub_[i];
-                    }
                     is_undone_ = true;
                     undo_available_.store(false, std::memory_order_relaxed);
                     redo_available_.store(true, std::memory_order_relaxed);
                 } else {
-                    // Redo
-                    for (size_t i = 0; i < loop_length_; ++i) {
-                        (*base_track_ptr_)[i] += last_overdub_[i];
-                    }
                     is_undone_ = false;
                     undo_available_.store(true, std::memory_order_relaxed);
                     redo_available_.store(false, std::memory_order_relaxed);
@@ -333,18 +392,28 @@ void LooperEngine::processPendingCommands() {
         if (load_cmd.buffer) {
             std::vector<float>* old_buf = base_track_ptr_;
             base_track_ptr_ = load_cmd.buffer;
-            return_queue_.push(old_buf); // Old buffer reclaimed by WavWorker
+            if (!return_queue_.push(old_buf)) {
+                if (overflow_return_buf_) delete overflow_return_buf_;
+                overflow_return_buf_ = old_buf;
+            }
 
             loop_length_ = base_track_ptr_->size();
             playhead_ = 0;
-            current_overdub_.resize(loop_length_);
-            std::fill(current_overdub_.begin(), current_overdub_.end(), 0.0f);
-            last_overdub_.clear();
+            last_layer_.assign(loop_length_, 0.0f);
             has_undo_layer_ = false;
             is_undone_ = false;
+            overdub_frames_recorded_ = 0;
+            pending_merge_active_ = false;
             undo_available_.store(false, std::memory_order_relaxed);
             redo_available_.store(false, std::memory_order_relaxed);
             state_.store(LooperState::STOPPED, std::memory_order_release);
+        }
+    }
+
+    // Retry draining overflow buffer to worker
+    if (overflow_return_buf_) {
+        if (return_queue_.push(overflow_return_buf_)) {
+            overflow_return_buf_ = nullptr;
         }
     }
 
@@ -355,13 +424,18 @@ void LooperEngine::processPendingCommands() {
             LooperState current = state_.load(std::memory_order_relaxed);
             // Allow save snapshot only when STOPPED and loop exists
             if (current == LooperState::STOPPED && base_track_ptr_ && !base_track_ptr_->empty()) {
-                slot_cmd.buffer->resize(base_track_ptr_->size());
-                std::copy(base_track_ptr_->begin(), base_track_ptr_->end(), slot_cmd.buffer->begin());
-                save_ready_queue_.push(slot_cmd.buffer);
+                active_save_buf_ = slot_cmd.buffer;
+                save_copy_total_ = std::min(base_track_ptr_->size(), active_save_buf_->capacity());
+                active_save_buf_->resize(save_copy_total_);
+                save_copy_progress_ = 0;
             } else {
                 // Not stopped or empty loop: signal failure with empty buffer
                 slot_cmd.buffer->clear();
-                save_ready_queue_.push(slot_cmd.buffer);
+                if (!save_ready_queue_.push(slot_cmd.buffer)) {
+                    active_save_buf_ = slot_cmd.buffer;
+                    save_copy_total_ = 0;
+                    save_copy_progress_ = 0;
+                }
             }
         }
     }
@@ -393,14 +467,14 @@ LooperStatus LooperEngine::getStatus() const {
     s.total_sec = static_cast<float>(s.total_frames) / config_.sample_rate;
     s.in_peak = in_peak_.load(std::memory_order_relaxed);
 
-    // Report effective latency based on monitor mode
-    uint32_t configured = latency_compensation_.load(std::memory_order_relaxed);
+    s.configured_latency_samples = latency_compensation_.load(std::memory_order_relaxed);
     if (s.monitor_mode == MonitorMode::DIRECT_ANALOG) {
-        s.effective_latency_samples = configured;
+        s.effective_latency_samples = s.configured_latency_samples;
     } else {
         s.effective_latency_samples = 0; // Software monitoring mode has zero overdub compensation
     }
     s.effective_latency_ms = (static_cast<float>(s.effective_latency_samples) / config_.sample_rate) * 1000.0f;
+    s.loop_gain = config_.loop_gain;
 
     s.is_reversed = is_reversed_.load(std::memory_order_relaxed);
     s.is_fading_out = is_fading_out_.load(std::memory_order_relaxed);

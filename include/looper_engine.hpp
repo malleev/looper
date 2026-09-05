@@ -52,12 +52,25 @@ private:
     std::atomic<size_t> status_loop_length_{0};
 
     // Pre-allocated loop buffers (owned and accessed exclusively by real-time audio thread)
-    static constexpr size_t MAX_LOOP_FRAMES = 48000 * 60 * 10; // 10 minutes max loop
     std::vector<float>* base_track_ptr_{nullptr};
-    std::vector<float> current_overdub_;
-    std::vector<float> last_overdub_;
+    std::vector<float> last_layer_;
     bool has_undo_layer_{false};
     bool is_undone_{false};
+
+    // Incremental overdub tracking (eliminates O(N) operations)
+    size_t overdub_frames_recorded_{0};
+    bool pending_merge_active_{false};
+    size_t pending_merge_idx_{0};
+    size_t pending_merge_frames_{0};
+
+    // Chunked non-blocking WAV save snapshot state
+    static constexpr size_t SAVE_CHUNK_SIZE = 4096;
+    std::vector<float>* active_save_buf_{nullptr};
+    size_t save_copy_progress_{0};
+    size_t save_copy_total_{0};
+
+    // Overflow return buffer fallback in case return queue is momentarily full
+    std::vector<float>* overflow_return_buf_{nullptr};
 
     // Rolling circular pre-roll buffer
     std::vector<float> pre_roll_buffer_;
