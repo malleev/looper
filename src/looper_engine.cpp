@@ -47,7 +47,8 @@ LooperEngine::~LooperEngine() {
     overflow_return_buf3_ = nullptr;
 }
 
-void LooperEngine::process(const float* in, float* out_left, float* out_right, size_t nframes, uint64_t block_start_ns) {
+void LooperEngine::process(const float* in, float* out_left, float* out_right, size_t nframes,
+                           uint64_t block_start_ns, uint64_t block_duration_ns) {
     // 1. Process pending Load and SaveSlot commands at block boundary
     processLoadAndSaveCommands();
 
@@ -108,11 +109,32 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     // 4. Collect and map pending control commands to sample offsets (Sample-Accurate Footswitch)
     ControlCommand pending_cmds[8];
     size_t num_cmds = 0;
+
+    // Check if a command was deferred from the previous block
+    if (has_deferred_cmd_) {
+        pending_cmds[num_cmds++] = deferred_cmd_;
+        has_deferred_cmd_ = false;
+    }
+
     while (num_cmds < 8 && ctrl_queue_.pop(pending_cmds[num_cmds])) {
-        auto& cmd = pending_cmds[num_cmds];
+        num_cmds++;
+    }
+
+    uint64_t block_end_ns = (block_start_ns > 0 && block_duration_ns > 0) ? (block_start_ns + block_duration_ns) : 0;
+
+    size_t valid_cmds = 0;
+    for (size_t i = 0; i < num_cmds; ++i) {
+        auto& cmd = pending_cmds[i];
         if (cmd.timestamp_ns > 0 && cmd.sample_offset == 0 && block_start_ns > 0) {
             if (cmd.timestamp_ns <= block_start_ns) {
                 cmd.sample_offset = 0;
+            } else if (block_end_ns > 0 && cmd.timestamp_ns >= block_end_ns) {
+                // Future command: belongs to next audio block! Defer it!
+                if (!has_deferred_cmd_) {
+                    deferred_cmd_ = cmd;
+                    has_deferred_cmd_ = true;
+                }
+                continue; // Do not execute in this block
             } else {
                 uint64_t diff_ns = cmd.timestamp_ns - block_start_ns;
                 uint64_t offset = (diff_ns * config_.sample_rate) / 1000000000ULL;
@@ -123,8 +145,9 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
         if (cmd.sample_offset >= nframes) {
             cmd.sample_offset = static_cast<uint32_t>(nframes - 1);
         }
-        num_cmds++;
+        pending_cmds[valid_cmds++] = cmd;
     }
+    num_cmds = valid_cmds;
 
     // Sort commands by intra-block sample offset
     for (size_t i = 1; i < num_cmds; ++i) {

@@ -102,6 +102,13 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
     const uint32_t play_ch = audio_cfg.playback_channels;
     const uint32_t cap_idx = audio_cfg.capture_channel_index;
 
+    // Validate capture channel index
+    if (cap_idx >= cap_ch) {
+        res.message = "Capture channel index (" + std::to_string(cap_idx) + 
+                      ") exceeds available capture channels (" + std::to_string(cap_ch) + ")";
+        return res;
+    }
+
     if (!setupAlsa(&cap_handle, audio_cfg.capture_device, SND_PCM_STREAM_CAPTURE, rate, period, periods, cap_ch)) {
         res.message = "Failed to open capture device: " + audio_cfg.capture_device;
         if (cap_handle) snd_pcm_close(cap_handle);
@@ -115,19 +122,34 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
     }
 
     std::vector<int32_t> in_buf(period * cap_ch, 0);
-    std::vector<int32_t> out_buf(period * play_ch, 0);
-    std::vector<int32_t> silence(period * play_ch, 0);
+    std::vector<int32_t> pulse_buf(period * play_ch, 0);
+    std::vector<int32_t> silence_buf(period * play_ch, 0);
     std::vector<float> mono_in(period, 0.0f);
 
     constexpr float INT32_TO_FLOAT = 1.0f / 2147483648.0f;
     constexpr int32_t PULSE_AMPLITUDE = static_cast<int32_t>(0.80f * 2147483647.0f);
 
-    // Prime playback buffer with 2 periods of silence cushion
-    writeAll(play_handle, silence.data(), period, play_ch);
-    writeAll(play_handle, silence.data(), period, play_ch);
+    // Prepare pulse buffer: impulse on Left/ch0 (and ch1 if stereo)
+    pulse_buf[0] = PULSE_AMPLITUDE;
+    if (play_ch > 1) {
+        pulse_buf[1] = PULSE_AMPLITUDE;
+    }
 
-    if (snd_pcm_start(cap_handle) < 0) {
-        res.message = "Failed to start capture PCM stream";
+    // Prime playback buffer with 2 periods of silence cushion (lockstep duplex base)
+    if (!writeAll(play_handle, silence_buf.data(), period, play_ch) ||
+        !writeAll(play_handle, silence_buf.data(), period, play_ch)) {
+        res.message = "Failed to prime playback buffer with silence cushion";
+        snd_pcm_close(cap_handle);
+        snd_pcm_close(play_handle);
+        return res;
+    }
+
+    uint64_t total_played_samples = 2 * period;
+    uint64_t total_recorded_samples = 0;
+
+    int err = snd_pcm_start(cap_handle);
+    if (err < 0) {
+        res.message = "Failed to start capture PCM stream: " + std::string(snd_strerror(err));
         snd_pcm_close(cap_handle);
         snd_pcm_close(play_handle);
         return res;
@@ -136,50 +158,26 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
     std::vector<uint32_t> measurements;
     measurements.reserve(num_pulses);
 
-    for (uint32_t pulse_idx = 0; pulse_idx < num_pulses; ++pulse_idx) {
-        // 1. Drain & silence flush (20 periods = ~53 ms)
-        for (int p = 0; p < 20; ++p) {
-            snd_pcm_readi(cap_handle, in_buf.data(), period);
-            writeAll(play_handle, silence.data(), period, play_ch);
-        }
+    enum class CalState {
+        WARMUP,
+        WAITING_FOR_RESPONSE,
+        COOLDOWN
+    };
 
-        // 2. Emit test impulse in playback buffer
-        std::fill(out_buf.begin(), out_buf.end(), 0);
-        // Put pulse on left/ch0 output
-        out_buf[0] = PULSE_AMPLITUDE;
-        if (play_ch > 1) out_buf[1] = PULSE_AMPLITUDE;
+    CalState state = CalState::WARMUP;
+    int state_counter = 0;
+    constexpr int WARMUP_PERIODS = 20;   // ~53 ms at 48kHz / 128
+    constexpr int COOLDOWN_PERIODS = 20; // ~53 ms between pulses
+    constexpr int TIMEOUT_PERIODS = 120; // ~320 ms timeout per pulse
 
-        writeAll(play_handle, out_buf.data(), period, play_ch);
-        int64_t emit_period = 0;
+    uint64_t pulse_playback_sample = 0;
 
-        // 3. Listen for response on capture
-        bool detected = false;
-        constexpr int MAX_WAIT_PERIODS = 100; // ~267 ms timeout
-        int wait_periods = 0;
-
-        while (wait_periods < MAX_WAIT_PERIODS && !detected) {
-            snd_pcm_sframes_t r = snd_pcm_readi(cap_handle, in_buf.data(), period);
-            writeAll(play_handle, silence.data(), period, play_ch);
-            if (r > 0) {
-                for (size_t s = 0; s < static_cast<size_t>(r); ++s) {
-                    float val = static_cast<float>(in_buf[s * cap_ch + cap_idx]) * INT32_TO_FLOAT;
-                    mono_in[s] = val;
-                }
-
-                int32_t offset = detectPulseOffset(mono_in.data(), r, 0.20f);
-                if (offset >= 0) {
-                    uint32_t rtl = static_cast<uint32_t>((wait_periods - emit_period) * period + offset);
-                    measurements.push_back(rtl);
-                    detected = true;
-                    break;
-                }
-            }
-            wait_periods++;
-        }
-
-        if (!detected) {
-            res.success = false;
-            res.message = "No loopback signal detected. Connect Audio Output 1 to Audio Input 1 and verify cable / gain.";
+    // Strict continuous lockstep streaming loop (exactly 1 read + 1 write per iteration)
+    while (measurements.size() < num_pulses) {
+        // 1. Read one period from capture
+        snd_pcm_sframes_t r = snd_pcm_readi(cap_handle, in_buf.data(), period);
+        if (r < 0) {
+            res.message = "ALSA read error during calibration: " + std::string(snd_strerror(static_cast<int>(r)));
             snd_pcm_drop(cap_handle);
             snd_pcm_drop(play_handle);
             snd_pcm_close(cap_handle);
@@ -187,11 +185,68 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
             return res;
         }
 
-        // Wait 10 periods before next pulse
-        for (int p = 0; p < 10; ++p) {
-            snd_pcm_readi(cap_handle, in_buf.data(), period);
-            writeAll(play_handle, silence.data(), period, play_ch);
+        // 2. State machine update & response detection
+        bool emit_pulse_now = false;
+
+        if (state == CalState::WARMUP) {
+            if (++state_counter >= WARMUP_PERIODS) {
+                // Emit pulse on next playback write
+                emit_pulse_now = true;
+                state = CalState::WAITING_FOR_RESPONSE;
+                state_counter = 0;
+            }
+        } else if (state == CalState::WAITING_FOR_RESPONSE) {
+            // Check incoming audio for impulse
+            for (size_t s = 0; s < static_cast<size_t>(r); ++s) {
+                mono_in[s] = static_cast<float>(in_buf[s * cap_ch + cap_idx]) * INT32_TO_FLOAT;
+            }
+
+            int32_t offset = detectPulseOffset(mono_in.data(), r, 0.20f);
+            if (offset >= 0) {
+                uint64_t pulse_capture_sample = total_recorded_samples + static_cast<uint64_t>(offset);
+                if (pulse_capture_sample >= pulse_playback_sample) {
+                    uint32_t rtl = static_cast<uint32_t>(pulse_capture_sample - pulse_playback_sample);
+                    measurements.push_back(rtl);
+                }
+                state = CalState::COOLDOWN;
+                state_counter = 0;
+            } else if (++state_counter >= TIMEOUT_PERIODS) {
+                res.success = false;
+                res.message = "No loopback signal detected. Connect Audio Output 1 to Audio Input 1 and verify cable / gain.";
+                snd_pcm_drop(cap_handle);
+                snd_pcm_drop(play_handle);
+                snd_pcm_close(cap_handle);
+                snd_pcm_close(play_handle);
+                return res;
+            }
+        } else if (state == CalState::COOLDOWN) {
+            if (++state_counter >= COOLDOWN_PERIODS) {
+                if (measurements.size() < num_pulses) {
+                    emit_pulse_now = true;
+                    state = CalState::WAITING_FOR_RESPONSE;
+                    state_counter = 0;
+                }
+            }
         }
+
+        total_recorded_samples += r;
+
+        // 3. Write one period to playback (lockstep pairing)
+        const int32_t* out_data = emit_pulse_now ? pulse_buf.data() : silence_buf.data();
+        if (emit_pulse_now) {
+            pulse_playback_sample = total_played_samples;
+        }
+
+        if (!writeAll(play_handle, out_data, period, play_ch)) {
+            res.message = "ALSA write error during calibration";
+            snd_pcm_drop(cap_handle);
+            snd_pcm_drop(play_handle);
+            snd_pcm_close(cap_handle);
+            snd_pcm_close(play_handle);
+            return res;
+        }
+
+        total_played_samples += period;
     }
 
     snd_pcm_drop(cap_handle);

@@ -490,7 +490,19 @@ int main(int argc, char* argv[]) {
     input_manager.start();
     std::cout << "[SYSTEM] Input manager ready. Waiting for triggers...\n" << std::endl;
 
+    bool fatal_error = false;
     while (g_running.load()) {
+        if (!audio_device.isRunning()) {
+            std::cerr << "\n[FATAL] Audio device stopped unexpectedly!" << std::endl;
+            auto snap = audio_device.getTelemetrySnapshot();
+            std::cerr << "Telemetry at failure: fatal_errors=" << snap.fatal_audio_errors
+                      << ", disconnects=" << snap.disconnects
+                      << ", suspends=" << snap.suspends
+                      << ", capture_xruns=" << snap.capture_xruns
+                      << ", playback_xruns=" << snap.playback_xruns << std::endl;
+            fatal_error = true;
+            break;
+        }
         printStatus(engine.getStatus(), current_loop_gain.load(std::memory_order_relaxed), audio_device.getTelemetrySnapshot());
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -501,5 +513,5 @@ int main(int argc, char* argv[]) {
     wav_worker.stop();
     std::cout << "[SYSTEM] Clean shutdown complete. Goodbye!" << std::endl;
 
-    return 0;
+    return fatal_error ? 1 : 0;
 }

@@ -285,16 +285,16 @@ bool AudioDevice::start() {
 }
 
 void AudioDevice::stop() {
-    if (!is_running_.load()) return;
+    const bool was_running = is_running_.exchange(false, std::memory_order_acq_rel);
 
-    is_running_.store(false);
-
-    // Unblock any blocking snd_pcm_readi / snd_pcm_writei calls immediately
-    if (capture_handle_) {
-        snd_pcm_drop(capture_handle_);
-    }
-    if (playback_handle_) {
-        snd_pcm_drop(playback_handle_);
+    if (was_running) {
+        // Unblock any blocking snd_pcm_readi / snd_pcm_writei calls immediately
+        if (capture_handle_) {
+            snd_pcm_drop(capture_handle_);
+        }
+        if (playback_handle_) {
+            snd_pcm_drop(playback_handle_);
+        }
     }
 
     if (audio_thread_.joinable()) {
@@ -381,6 +381,14 @@ bool AudioDevice::recoverDuplex(int err, snd_pcm_stream_t stream) {
 }
 
 void AudioDevice::audioLoop() {
+    // Ensure is_running_ is unconditionally set to false on thread exit (normal or error)
+    struct LoopExitGuard {
+        std::atomic<bool>& running;
+        ~LoopExitGuard() {
+            running.store(false, std::memory_order_release);
+        }
+    } exit_guard{is_running_};
+
     // Set real-time thread priority (SCHED_FIFO) - record status via atomic telemetry
     struct sched_param param;
     param.sched_priority = 80;
@@ -419,16 +427,22 @@ void AudioDevice::audioLoop() {
             mono_in_[i] = static_cast<float>(in_buffer_[i * cap_channels + cap_idx]) * INT32_TO_FLOAT;
         }
 
-        // Process audio in LooperEngine with execution timing
-        auto t_start = std::chrono::steady_clock::now();
-        uint64_t block_start_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t_start.time_since_epoch()).count()
+        // snd_pcm_readi unblocks at the end of recording the current block.
+        // Therefore, block_start_ns is read_done_ns minus the block duration in nanoseconds.
+        auto t_read_done = std::chrono::steady_clock::now();
+        uint64_t read_done_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_read_done.time_since_epoch()).count()
         );
-        engine_.process(mono_in_.data(), stereo_out_left_.data(), stereo_out_right_.data(), frames_read, block_start_ns);
+        uint64_t block_duration_ns = (static_cast<uint64_t>(frames_read) * 1000000000ULL) / capture_params_.sample_rate;
+        uint64_t block_start_ns = (read_done_ns > block_duration_ns) ? (read_done_ns - block_duration_ns) : 0;
+
+        // Process audio in LooperEngine with sample-accurate timestamp mapping
+        engine_.process(mono_in_.data(), stereo_out_left_.data(), stereo_out_right_.data(),
+                        static_cast<size_t>(frames_read), block_start_ns, block_duration_ns);
         auto t_end = std::chrono::steady_clock::now();
 
         uint32_t elapsed_us = static_cast<uint32_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count()
+            std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_read_done).count()
         );
 
         // Update atomic process_max_us

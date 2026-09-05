@@ -8,6 +8,8 @@
 #include <linux/input.h>
 #include <cstring>
 #include <dirent.h>
+#include <sys/ioctl.h>
+#include <chrono>
 
 namespace looper {
 
@@ -36,6 +38,9 @@ void InputManager::scanEvdevDevices() {
                         ioctl(fd, EVIOCGNAME(sizeof(name)), name);
                         std::cout << "[INPUT] Found physical keyboard: " << name 
                                   << " (" << path << ")" << std::endl;
+                        // Align evdev event timestamps with CLOCK_MONOTONIC / std::chrono::steady_clock
+                        unsigned int clk = CLOCK_MONOTONIC;
+                        ioctl(fd, EVIOCSCLOCKID, &clk);
                         evdev_fds_.push_back(fd);
                         continue;
                     }
@@ -165,10 +170,15 @@ void InputManager::workerLoop() {
                             default: break;
                         }
                         if (ak != ActionKey::NONE && callback_) {
-                            auto now = std::chrono::steady_clock::now();
-                            uint64_t ts_ns = static_cast<uint64_t>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()
-                            );
+                            // Extract kernel hardware timestamp from evdev event (CLOCK_MONOTONIC)
+                            uint64_t ts_ns = static_cast<uint64_t>(ev.input_event_sec) * 1000000000ULL +
+                                             static_cast<uint64_t>(ev.input_event_usec) * 1000ULL;
+                            if (ts_ns == 0) {
+                                auto now = std::chrono::steady_clock::now();
+                                ts_ns = static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count()
+                                );
+                            }
                             callback_(ak, ts_ns);
                         }
                     }

@@ -20,7 +20,8 @@ public:
     ~LooperEngine();
 
     // REAL-TIME AUDIO PROCESSING (Runs strictly on real-time audio thread)
-    void process(const float* in, float* out_left, float* out_right, size_t nframes, uint64_t block_start_ns = 0);
+    void process(const float* in, float* out_left, float* out_right, size_t nframes,
+                 uint64_t block_start_ns = 0, uint64_t block_duration_ns = 0);
 
     // Thread-safe query for UI
     LooperStatus getStatus() const;
@@ -97,6 +98,10 @@ private:
     // Fade-out counters
     size_t fade_out_total_frames_{0};
     size_t fade_out_remaining_frames_{0};
+
+    // Deferred future command storage for commands with timestamps in future blocks
+    bool has_deferred_cmd_{false};
+    ControlCommand deferred_cmd_{};
 };
 
 } // namespace looper

@@ -52,6 +52,7 @@ void test_wav_sample_rate_validation() {
         std::vector<float> dummy(44100, 0.2f);
         bool ok = WavFile::save(bad_wav, dummy, 44100);
         assert(ok);
+        (void)ok;
     }
 
     // Try loading with expected 48000 Hz
@@ -61,6 +62,7 @@ void test_wav_sample_rate_validation() {
     assert(!loaded_ok);
     assert(!err.empty());
     assert(err.find("Sample rate mismatch") != std::string::npos);
+    (void)loaded_ok;
 
     // 2. Create a mock 48.0kHz WAV file
     std::string good_wav = "test_48k.wav";
@@ -68,11 +70,13 @@ void test_wav_sample_rate_validation() {
         std::vector<float> dummy(48000, 0.35f);
         bool ok = WavFile::save(good_wav, dummy, 48000);
         assert(ok);
+        (void)ok;
     }
 
     // Try loading with expected 48000 Hz
     loaded_ok = WavFile::load(good_wav, loaded, 48000, err);
     assert(loaded_ok);
+    (void)loaded_ok;
     assert(loaded.size() == 48000);
     assert(std::abs(loaded[100] - 0.35f) < 0.01f);
 
@@ -305,6 +309,7 @@ void test_preroll_length_compensation() {
     assert(status.state == LooperState::PLAYING);
     // Despite 256 frames of pre-roll at start, loop length should match the exact 2048 musical frames recorded!
     assert(status.total_frames == 2048);
+    (void)status;
 
     std::cout << "PASSED!" << std::endl;
 }
@@ -364,6 +369,7 @@ void test_zero_on_transition_timing() {
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     assert(engine.getStatus().state == LooperState::PLAYING);
     assert(elapsed_us < 2000);
+    (void)elapsed_us;
 
     // Measure UNDO time (must be O(1))
     cmd.type = ControlCommandType::UNDO_REDO;
@@ -446,6 +452,8 @@ void test_partial_overdub_with_latency() {
             bool is_08 = std::abs(val - 0.8f) < 0.01f;
             bool is_05 = std::abs(val - 0.5f) < 0.01f;
             assert(is_08 || is_05);
+            (void)is_08;
+            (void)is_05;
         }
     }
 
@@ -597,6 +605,7 @@ void test_save_interrupted_by_clear_and_load() {
     std::vector<float>* ready_buf = nullptr;
     bool got_buf = save_ready_queue.pop(ready_buf);
     assert(got_buf);
+    (void)got_buf;
     assert(ready_buf == save_buf);
     assert(ready_buf->empty()); // Empty marks aborted save
     delete save_buf;
@@ -1350,6 +1359,7 @@ void test_reverse_continuity_no_position_jump() {
     float first_rev_sample = out_l[0];
     float jump = std::abs(first_rev_sample - last_fwd_sample);
     assert(jump < 0.005f); // Max 5 samples delta, continuous!
+    (void)jump;
 
     // Play backwards and verify decreasing slope
     assert(out_l[10] > out_l[20]);
@@ -1362,6 +1372,7 @@ void test_reverse_continuity_no_position_jump() {
     float first_fwd_sample = out_l[0];
     float jump_back = std::abs(first_fwd_sample - last_rev_sample);
     assert(jump_back < 0.005f); // Smooth continuity in both directions!
+    (void)jump_back;
 
     std::cout << "PASSED!" << std::endl;
 }
@@ -1430,6 +1441,7 @@ void test_latency_calibrator_pulse_detection() {
 
     int32_t detected = LatencyCalibrator::detectPulseOffset(buffer.data(), buffer.size(), 0.25f);
     assert(detected == 73);
+    (void)detected;
 
     // 2. Negative case: no signal above threshold
     std::vector<float> silence(256, 0.05f);
@@ -1442,10 +1454,122 @@ void test_latency_calibrator_pulse_detection() {
     std::vector<uint32_t> measurements = {390, 384, 382};
     uint32_t med = LatencyCalibrator::calculateMedian(measurements);
     assert(med == 384);
+    (void)med;
 
     std::vector<uint32_t> even_measurements = {380, 384, 386, 390};
     uint32_t med_even = LatencyCalibrator::calculateMedian(even_measurements);
     assert(med_even == 385);
+    (void)med_even;
+
+    std::cout << "PASSED!" << std::endl;
+}
+
+void test_timestamp_to_sample_offset_and_deferral() {
+    std::cout << "[TEST] Timestamp-to-Sample-Offset & Future Command Deferral... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.5f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // 1. Start Recording at Block 0
+    constexpr uint64_t B_DUR = (128ULL * 1000000000ULL) / 48000ULL; // 2666666 ns
+    uint64_t b0_start = 1000000000ULL;
+
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    cmd.timestamp_ns = b0_start;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128, b0_start, B_DUR);
+    assert(engine.getStatus().state == LooperState::RECORDING);
+    assert(engine.getStatus().total_frames == 128);
+
+    // 2. Intra-block timestamp test:
+    // In Block 1, send ACTION command with timestamp exactly 1.0 ms (1,000,000 ns) after b1_start.
+    // At 48 kHz, 1 ms is exactly 48 samples.
+    // Command executes at sample 48 of this block, ending REC -> PLAYING.
+    // Total frames recorded must be exactly 128 + 48 = 176 frames.
+    uint64_t b1_start = b0_start + B_DUR;
+    cmd.type = ControlCommandType::ACTION;
+    cmd.timestamp_ns = b1_start + 1000000ULL; // 1.0 ms intra-block offset
+    cmd.sample_offset = 0;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128, b1_start, B_DUR);
+
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().total_frames == 176);
+
+    for (size_t i = 0; i < 48; ++i) {
+        assert(std::abs(out_l[i]) < 1e-4f);
+    }
+    for (size_t i = 48; i < 128; ++i) {
+        assert(std::abs(out_l[i] - 0.5f) < 1e-4f);
+    }
+
+    // Clear and reset for Future Command Deferral test
+    cmd.type = ControlCommandType::CLEAR;
+    cmd.timestamp_ns = 0;
+    cmd.sample_offset = 0;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128, b1_start + B_DUR, B_DUR);
+    assert(engine.getStatus().state == LooperState::IDLE);
+
+    // 3. Future Command Deferral Test:
+    // Start Recording in Block A
+    uint64_t ba_start = 2000000000ULL;
+    cmd.type = ControlCommandType::ACTION;
+    cmd.timestamp_ns = ba_start;
+    cmd.sample_offset = 0;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.7f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128, ba_start, B_DUR);
+    assert(engine.getStatus().state == LooperState::RECORDING);
+    assert(engine.getStatus().total_frames == 128);
+
+    // In Block B, queue an ACTION command whose timestamp is in the FUTURE (Block C)
+    // Block B spans [bb_start, bb_start + B_DUR).
+    // Let timestamp be bc_start + 500,000 ns (500 us into Block C).
+    // At 48 kHz, 500 us = 24 samples.
+    uint64_t bb_start = ba_start + B_DUR;
+    uint64_t bc_start = bb_start + B_DUR;
+    uint64_t future_ts = bc_start + 500000ULL;
+
+    cmd.type = ControlCommandType::ACTION;
+    cmd.timestamp_ns = future_ts;
+    cmd.sample_offset = 0;
+    ctrl_queue.push(cmd);
+
+    // Process Block B: future command must NOT execute here
+    engine.process(in.data(), out_l.data(), out_r.data(), 128, bb_start, B_DUR);
+    assert(engine.getStatus().state == LooperState::RECORDING);
+    assert(engine.getStatus().total_frames == 256); // 128 + 128
+
+    // Process Block C: deferred command is executed at sample offset 24
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128, bc_start, B_DUR);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().total_frames == 280); // 256 + 24
+
+    for (size_t i = 0; i < 24; ++i) {
+        assert(std::abs(out_l[i]) < 1e-4f);
+    }
+    for (size_t i = 24; i < 128; ++i) {
+        assert(std::abs(out_l[i] - 0.7f) < 1e-4f);
+    }
 
     std::cout << "PASSED!" << std::endl;
 }
@@ -1477,8 +1601,9 @@ int main() {
     test_reverse_continuity_no_position_jump();
     test_sample_accurate_action_trigger();
     test_latency_calibrator_pulse_detection();
+    test_timestamp_to_sample_offset_and_deferral();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (22/22)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (23/23)" << std::endl;
     return 0;
 }
 
