@@ -40,6 +40,8 @@ LooperEngine::~LooperEngine() {
     last_layer_ptr_ = nullptr;
     delete record_layer_ptr_;
     record_layer_ptr_ = nullptr;
+    delete merge_layer_ptr_;
+    merge_layer_ptr_ = nullptr;
     delete overflow_return_buf_;
     overflow_return_buf_ = nullptr;
     delete overflow_return_buf2_;
@@ -61,11 +63,15 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
         } else {
             size_t chunk = std::min(SAVE_CHUNK_SIZE, save_copy_total_ - save_copy_progress_);
             bool include_last = (!is_undone_ && has_undo_layer_ && last_layer_ptr_ && last_layer_ptr_->size() >= save_copy_total_);
+            bool include_merge = (merge_layer_ptr_ && merge_last_to_base_ && merge_layer_ptr_->size() >= save_copy_total_);
             for (size_t c = 0; c < chunk; ++c) {
                 size_t idx = save_copy_progress_ + c;
                 float s = (*base_track_ptr_)[idx];
                 if (include_last) {
                     s += (*last_layer_ptr_)[idx];
+                }
+                if (include_merge) {
+                    s += (*merge_layer_ptr_)[idx];
                 }
                 (*active_save_buf_)[idx] = s;
             }
@@ -79,20 +85,26 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     }
 
     // 3. Advance background chunked layer merge (strictly linear index 0..loop_length, 8192 samples / ~15us)
-    if (pending_merge_active_ && loop_length_ > 0) {
+    if (pending_merge_active_ && loop_length_ > 0 && merge_layer_ptr_) {
         size_t chunk = std::min(MERGE_CHUNK_SIZE, pending_merge_frames_);
         for (size_t c = 0; c < chunk; ++c) {
             size_t idx = pending_merge_idx_++;
-            if (idx < base_track_ptr_->size() && idx < last_layer_ptr_->size()) {
+            if (idx < base_track_ptr_->size() && idx < merge_layer_ptr_->size()) {
                 if (merge_last_to_base_) {
-                    (*base_track_ptr_)[idx] += (*last_layer_ptr_)[idx];
+                    (*base_track_ptr_)[idx] += (*merge_layer_ptr_)[idx];
                 }
-                (*last_layer_ptr_)[idx] = 0.0f;
+                (*merge_layer_ptr_)[idx] = 0.0f;
             }
         }
         pending_merge_frames_ -= chunk;
         if (pending_merge_frames_ == 0) {
             pending_merge_active_ = false;
+            // Only assign to record_layer_ptr_ if not currently in OVERDUB!
+            // (While in OVERDUB, record_layer_ptr_ is actively recording new take)
+            if (state_.load(std::memory_order_relaxed) != LooperState::OVERDUB) {
+                record_layer_ptr_ = merge_layer_ptr_; // 100% pre-zeroed scratchpad ready for next overdub!
+                merge_layer_ptr_ = nullptr;
+            }
         }
     }
 
@@ -140,10 +152,13 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
                 if (read_idx < base_track_ptr_->size()) {
                     loop_sample = (*base_track_ptr_)[read_idx];
                 }
-                if (!is_undone_ && read_idx < last_layer_ptr_->size()) {
+                if (last_layer_ptr_ && !is_undone_ && read_idx < last_layer_ptr_->size()) {
                     loop_sample += (*last_layer_ptr_)[read_idx];
                 }
-                if (current_state == LooperState::OVERDUB && read_idx < record_layer_ptr_->size()) {
+                if (merge_layer_ptr_ && merge_last_to_base_ && read_idx < merge_layer_ptr_->size()) {
+                    loop_sample += (*merge_layer_ptr_)[read_idx];
+                }
+                if (current_state == LooperState::OVERDUB && record_layer_ptr_ && read_idx < record_layer_ptr_->size()) {
                     loop_sample += (*record_layer_ptr_)[read_idx];
                 }
 
@@ -166,7 +181,7 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
                 right += loop_sample;
 
                 // Handle Overdub with Transport-Domain Latency Compensation (strictly incremental O(1))
-                if (current_state == LooperState::OVERDUB) {
+                if (current_state == LooperState::OVERDUB && record_layer_ptr_) {
                     size_t comp_playhead = 0;
                     if (playhead_ >= (K % loop_length_)) {
                         comp_playhead = playhead_ - (K % loop_length_);
@@ -199,6 +214,37 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     // Atomically publish status for UI thread (eliminates getStatus data race)
     status_playhead_.store(playhead_, std::memory_order_relaxed);
     status_loop_length_.store(loop_length_, std::memory_order_relaxed);
+}
+
+void LooperEngine::abortActiveSave() {
+    if (active_save_buf_) {
+        active_save_buf_->clear();
+        save_copy_total_ = 0;
+        save_copy_progress_ = 0;
+        if (save_ready_queue_.push(active_save_buf_)) {
+            active_save_buf_ = nullptr;
+        }
+    }
+}
+
+void LooperEngine::commitOverdubTake() {
+    if (merge_layer_ptr_) {
+        if (!pending_merge_active_) {
+            last_layer_ptr_ = record_layer_ptr_;
+            record_layer_ptr_ = merge_layer_ptr_;
+            merge_layer_ptr_ = nullptr;
+        } else {
+            last_layer_ptr_ = record_layer_ptr_;
+            record_layer_ptr_ = nullptr;
+        }
+    } else {
+        std::swap(last_layer_ptr_, record_layer_ptr_);
+    }
+
+    has_undo_layer_ = true;
+    is_undone_ = false;
+    undo_available_.store(true, std::memory_order_relaxed);
+    redo_available_.store(false, std::memory_order_relaxed);
 }
 
 void LooperEngine::processPendingCommands() {
@@ -262,9 +308,14 @@ void LooperEngine::processPendingCommands() {
                         break;
                     }
                     case LooperState::PLAYING: {
-                        // Start overdub (strictly O(1))
-                        // If previous layer exists, start background linear merge into base
-                        if (has_undo_layer_) {
+                        // Cannot start new overdub while scratchpad is still merging in background
+                        if (record_layer_ptr_ == nullptr) {
+                            break;
+                        }
+                        // Move previous overdub to merge_layer_ptr_ to begin background linear merge
+                        if (has_undo_layer_ && last_layer_ptr_) {
+                            merge_layer_ptr_ = last_layer_ptr_;
+                            last_layer_ptr_ = nullptr;
                             merge_last_to_base_ = !is_undone_;
                             pending_merge_active_ = true;
                             pending_merge_idx_ = 0;
@@ -278,38 +329,13 @@ void LooperEngine::processPendingCommands() {
                         break;
                     }
                     case LooperState::OVERDUB: {
-                        // Transition OVERDUB -> PLAYING
-                        // Finish any remaining merge of old last_layer to leave it clean
-                        while (pending_merge_active_) {
-                            size_t chunk = std::min(MERGE_CHUNK_SIZE, pending_merge_frames_);
-                            for (size_t c = 0; c < chunk; ++c) {
-                                size_t idx = pending_merge_idx_++;
-                                if (idx < base_track_ptr_->size() && idx < last_layer_ptr_->size()) {
-                                    if (merge_last_to_base_) {
-                                        (*base_track_ptr_)[idx] += (*last_layer_ptr_)[idx];
-                                    }
-                                    (*last_layer_ptr_)[idx] = 0.0f;
-                                }
-                            }
-                            pending_merge_frames_ -= chunk;
-                            if (pending_merge_frames_ == 0) {
-                                pending_merge_active_ = false;
-                            }
-                        }
-
-                        // Pointer swap (strictly O(1)): newly recorded layer becomes last_layer,
-                        // pre-zeroed last_layer becomes record_layer for future overdubs!
-                        std::swap(last_layer_ptr_, record_layer_ptr_);
-
-                        has_undo_layer_ = true;
-                        is_undone_ = false;
-                        undo_available_.store(true, std::memory_order_relaxed);
-                        redo_available_.store(false, std::memory_order_relaxed);
+                        commitOverdubTake();
                         state_.store(LooperState::PLAYING, std::memory_order_release);
                         break;
                     }
                     case LooperState::STOPPED: {
                         if (loop_length_ > 0) {
+                            abortActiveSave();
                             is_fading_out_.store(false, std::memory_order_relaxed);
                             state_.store(LooperState::PLAYING, std::memory_order_release);
                         }
@@ -340,29 +366,7 @@ void LooperEngine::processPendingCommands() {
                         state_.store(LooperState::IDLE, std::memory_order_release);
                     }
                 } else if (current == LooperState::OVERDUB) {
-                    while (pending_merge_active_) {
-                        size_t chunk = std::min(MERGE_CHUNK_SIZE, pending_merge_frames_);
-                        for (size_t c = 0; c < chunk; ++c) {
-                            size_t idx = pending_merge_idx_++;
-                            if (idx < base_track_ptr_->size() && idx < last_layer_ptr_->size()) {
-                                if (merge_last_to_base_) {
-                                    (*base_track_ptr_)[idx] += (*last_layer_ptr_)[idx];
-                                }
-                                (*last_layer_ptr_)[idx] = 0.0f;
-                            }
-                        }
-                        pending_merge_frames_ -= chunk;
-                        if (pending_merge_frames_ == 0) {
-                            pending_merge_active_ = false;
-                        }
-                    }
-
-                    std::swap(last_layer_ptr_, record_layer_ptr_);
-
-                    has_undo_layer_ = true;
-                    is_undone_ = false;
-                    undo_available_.store(true, std::memory_order_relaxed);
-                    redo_available_.store(false, std::memory_order_relaxed);
+                    commitOverdubTake();
                     state_.store(LooperState::STOPPED, std::memory_order_release);
                 } else if (current == LooperState::PLAYING) {
                     state_.store(LooperState::STOPPED, std::memory_order_release);
@@ -371,35 +375,39 @@ void LooperEngine::processPendingCommands() {
                 break;
             }
             case ControlCommandType::CLEAR: {
-                // If a save snapshot is in progress, abort it safely to protect base_track_ptr_
-                if (active_save_buf_) {
-                    active_save_buf_->clear();
-                    save_copy_total_ = 0;
-                    save_copy_progress_ = 0;
-                    if (save_ready_queue_.push(active_save_buf_)) {
-                        active_save_buf_ = nullptr;
+                abortActiveSave();
+                pending_merge_active_ = false;
+                pending_merge_frames_ = 0;
+                if (merge_layer_ptr_) {
+                    if (!record_layer_ptr_) {
+                        record_layer_ptr_ = merge_layer_ptr_;
+                    } else if (!last_layer_ptr_) {
+                        last_layer_ptr_ = merge_layer_ptr_;
                     }
+                    merge_layer_ptr_ = nullptr;
                 }
 
                 state_.store(LooperState::IDLE, std::memory_order_release);
-                base_track_ptr_->clear();
-                last_layer_ptr_->clear();
-                record_layer_ptr_->clear();
+                if (base_track_ptr_) base_track_ptr_->clear();
+                if (last_layer_ptr_) last_layer_ptr_->clear();
+                if (record_layer_ptr_) record_layer_ptr_->clear();
                 loop_length_ = 0;
                 playhead_ = 0;
                 has_undo_layer_ = false;
                 is_undone_ = false;
                 overdub_frames_recorded_ = 0;
-                pending_merge_active_ = false;
-                pending_merge_frames_ = 0;
                 is_fading_out_.store(false, std::memory_order_relaxed);
                 undo_available_.store(false, std::memory_order_relaxed);
                 redo_available_.store(false, std::memory_order_relaxed);
                 break;
             }
             case ControlCommandType::UNDO_REDO: {
-                // Strictly O(1): instant layer toggle without traversing buffers!
-                if (!has_undo_layer_ || loop_length_ == 0) break;
+                // Disallow UNDO/REDO during active OVERDUB recording
+                LooperState current = state_.load(std::memory_order_relaxed);
+                if (current == LooperState::OVERDUB) break;
+
+                abortActiveSave();
+                if (!has_undo_layer_ || !last_layer_ptr_ || loop_length_ == 0) break;
 
                 if (!is_undone_) {
                     is_undone_ = true;
@@ -423,7 +431,12 @@ void LooperEngine::processPendingCommands() {
             }
             case ControlCommandType::TRIGGER_FADE: {
                 LooperState current = state_.load(std::memory_order_relaxed);
-                if (current == LooperState::PLAYING || current == LooperState::OVERDUB) {
+                if (current == LooperState::OVERDUB) {
+                    commitOverdubTake();
+                    state_.store(LooperState::PLAYING, std::memory_order_release);
+                    current = LooperState::PLAYING;
+                }
+                if (current == LooperState::PLAYING) {
                     fade_out_total_frames_ = static_cast<size_t>(config_.fade_out_sec * config_.sample_rate);
                     fade_out_remaining_frames_ = fade_out_total_frames_;
                     is_fading_out_.store(true, std::memory_order_relaxed);
@@ -467,19 +480,19 @@ void LooperEngine::processPendingCommands() {
     LoadCommand load_cmd;
     while (load_queue_.pop(load_cmd)) {
         if (load_cmd.base_buffer && load_cmd.layer_buffer && load_cmd.record_buffer) {
-            // Abort active save if in progress
-            if (active_save_buf_) {
-                active_save_buf_->clear();
-                save_copy_total_ = 0;
-                save_copy_progress_ = 0;
-                if (save_ready_queue_.push(active_save_buf_)) {
-                    active_save_buf_ = nullptr;
-                }
-            }
+            abortActiveSave();
+            pending_merge_active_ = false;
+            pending_merge_frames_ = 0;
 
             std::vector<float>* old_base = base_track_ptr_;
             std::vector<float>* old_layer = last_layer_ptr_;
             std::vector<float>* old_record = record_layer_ptr_;
+            if (merge_layer_ptr_) {
+                if (!old_layer) old_layer = merge_layer_ptr_;
+                else if (!old_record) old_record = merge_layer_ptr_;
+                merge_layer_ptr_ = nullptr;
+            }
+
             base_track_ptr_ = load_cmd.base_buffer;
             last_layer_ptr_ = load_cmd.layer_buffer;
             record_layer_ptr_ = load_cmd.record_buffer;
@@ -499,8 +512,6 @@ void LooperEngine::processPendingCommands() {
             has_undo_layer_ = false;
             is_undone_ = false;
             overdub_frames_recorded_ = 0;
-            pending_merge_active_ = false;
-            pending_merge_frames_ = 0;
             undo_available_.store(false, std::memory_order_relaxed);
             redo_available_.store(false, std::memory_order_relaxed);
             state_.store(LooperState::STOPPED, std::memory_order_release);

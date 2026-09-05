@@ -29,6 +29,8 @@ private:
     // Process pending commands on audio block boundaries
     void processPendingCommands();
     void applyLoopSeamCrossfade();
+    void abortActiveSave();
+    void commitOverdubTake();
 
     ControlQueue& ctrl_queue_;
     LoadQueue& load_queue_;
@@ -56,6 +58,7 @@ private:
     std::vector<float>* base_track_ptr_{nullptr};
     std::vector<float>* last_layer_ptr_{nullptr};
     std::vector<float>* record_layer_ptr_{nullptr};
+    std::vector<float>* merge_layer_ptr_{nullptr};
     bool has_undo_layer_{false};
     bool is_undone_{false};
 

@@ -904,6 +904,277 @@ void test_overdub_mode_locks() {
     std::cout << "PASSED!" << std::endl;
 }
 
+void test_second_overdub_immediate_exit_timing() {
+    std::cout << "[TEST] Large Loop (500k samples) 2nd Overdub Immediate Exit Timing (O(1))... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+    config.latency_compensation = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.1f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+
+    // Record a 500,000 samples base loop (~10.4 seconds)
+    constexpr size_t TOTAL_BLOCKS = 500000 / 128;
+    for (size_t b = 0; b < TOTAL_BLOCKS; ++b) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+
+    // Enter PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // 1. First Overdub: record 1 block and exit
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::OVERDUB);
+
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().undo_available == true);
+
+    // 2. Second Overdub: starts while previous layer exists!
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::OVERDUB);
+
+    // Now IMMEDIATELY exit second overdub (after only 1 block, leaving 499,872 samples unmerged!)
+    // If the engine did while (pending_merge_active_), this would block and fail the timing check!
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    std::cout << "(elapsed: " << elapsed_us << " us) " << std::flush;
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(elapsed_us < 10000); // Strictly O(1): bounded in microseconds under ASan, NOT 500,000 samples!
+
+    std::cout << "PASSED! (Elapsed: " << elapsed_us << " us)" << std::endl;
+}
+
+void test_undo_disallowed_during_overdub() {
+    std::cout << "[TEST] UNDO / REDO Ignored During Active OVERDUB... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.5f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // Record base loop
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // Complete Layer 1
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().undo_available == true);
+
+    // Start Layer 2 overdub
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::OVERDUB);
+
+    // Attempt UNDO during OVERDUB -> must be ignored!
+    cmd.type = ControlCommandType::UNDO_REDO;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::OVERDUB);
+
+    // Exit overdub -> PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().undo_available == true);
+
+    // In PLAYING, UNDO now works!
+    cmd.type = ControlCommandType::UNDO_REDO;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().undo_available == false);
+    assert(engine.getStatus().redo_available == true);
+
+    std::cout << "PASSED!" << std::endl;
+}
+
+void test_fade_during_overdub_preserves_take() {
+    std::cout << "[TEST] Fade Triggered in OVERDUB Preserves Overdub Take... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+    config.fade_out_sec = 0.05f; // Fast fade for testing (~2400 samples = ~19 blocks)
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.5f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // Record base loop of 2 blocks = 256 samples
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+
+    // Enter PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // Enter OVERDUB, record 2 blocks of 0.3f (full 256 samples loop)
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.3f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::OVERDUB);
+
+    // Trigger FADE directly while in OVERDUB!
+    cmd.type = ControlCommandType::TRIGGER_FADE;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().is_fading_out == true);
+
+    // Process blocks until fade completes and state becomes STOPPED
+    while (engine.getStatus().state != LooperState::STOPPED) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    assert(engine.getStatus().state == LooperState::STOPPED);
+    assert(engine.getStatus().total_frames == 256);
+    // Overdub take must be committed as undo_available layer!
+    assert(engine.getStatus().undo_available == true);
+
+    // Resume playback with ACTION: audio should contain the recorded overdub (0.5f + 0.3f = 0.8f)
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    for (int i = 0; i < 128; ++i) {
+        assert(std::abs(out_l[i] - 0.8f) < 0.01f);
+    }
+
+    std::cout << "PASSED!" << std::endl;
+}
+
+void test_action_aborts_active_save() {
+    std::cout << "[TEST] ACTION Aborts Active WAV Save to Prevent Source Buffer Mutation... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.4f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // Record loop and stop
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    for (int i = 0; i < 300; ++i) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128); // 38400 samples
+    }
+    cmd.type = ControlCommandType::STOP;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::STOPPED);
+
+    // Request save
+    auto* save_buf = new std::vector<float>(38400);
+    SaveSlotCommand slot;
+    slot.buffer = save_buf;
+    save_slot_queue.push(slot);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128); // begins copying
+
+    // Press ACTION -> should safely abort save and enter PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // Verify aborted buffer was returned
+    std::vector<float>* ready_buf = nullptr;
+    assert(save_ready_queue.pop(ready_buf));
+    assert(ready_buf == save_buf);
+    assert(ready_buf->empty()); // marked empty = aborted
+    delete ready_buf;
+
+    std::cout << "PASSED!" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  RUNNING LOOPER ENGINE UNIT TESTS      " << std::endl;
@@ -922,8 +1193,12 @@ int main() {
     test_wav_save_includes_active_overdub();
     test_large_loop_partial_overdub_and_undo();
     test_overdub_mode_locks();
+    test_second_overdub_immediate_exit_timing();
+    test_undo_disallowed_during_overdub();
+    test_fade_during_overdub_preserves_take();
+    test_action_aborts_active_save();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (13/13)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (17/17)" << std::endl;
     return 0;
 }
 
