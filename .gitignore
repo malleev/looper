@@ -1,7 +1,11 @@
-# Build directory
+# Build directory and binaries
 build/
 bin/
 obj/
+looper
+*.o
+*.a
+*.so
 
 # CMake artifacts
 CMakeCache.txt
@@ -9,10 +13,14 @@ CMakeFiles/
 cmake_install.cmake
 *.cmake
 
-# Temp and audio files
+# Recordings and audio files
+recordings/
 *.wav
 *.raw
 *.log
+.terminal.lock
+
+# IDE and OS files
 .DS_Store
 Thumbs.db
 .vscode/
