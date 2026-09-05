@@ -13,18 +13,25 @@ TEST_SRCS = test/test_suite.cpp src/looper_engine.cpp src/wav_file.cpp src/wav_w
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -UNDEBUG -o $@ $(filter %.cpp %.o,$^) $(LDFLAGS)
 
-$(TEST_TARGET): $(TEST_SRCS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+$(TEST_TARGET): $(TEST_SRCS) $(wildcard include/*.hpp)
+	$(CXX) $(CXXFLAGS) -UNDEBUG -o $@ $(filter %.cpp %.o,$^) $(LDFLAGS)
 
-test: $(TEST_TARGET)
+test: $(TEST_TARGET) looper_regressions
 	./$(TEST_TARGET)
+	./looper_regressions
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET) $(TEST_TARGET) test_44k.wav test_48k.wav
+	rm -f $(OBJS) $(OBJS:.o=.d) looper_regressions $(TARGET) $(TEST_TARGET) test_44k.wav test_48k.wav
 
 .PHONY: all clean test
+
+.DEFAULT_GOAL := all
+-include $(OBJS:.o=.d)
+
+looper_regressions: test/regression.cpp src/looper_engine.cpp src/wav_file.cpp src/wav_worker.cpp $(wildcard include/*.hpp)
+	$(CXX) $(CXXFLAGS) -UNDEBUG -o $@ $(filter %.cpp,$^) $(LDFLAGS)

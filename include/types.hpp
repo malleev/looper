@@ -49,6 +49,7 @@ inline const char* monitorModeToString(MonitorMode mode) {
 }
 
 struct LooperConfig {
+    size_t max_loop_frames = MAX_LOOP_FRAMES;
     uint32_t sample_rate = DEFAULT_SAMPLE_RATE;
     uint32_t period_size = DEFAULT_PERIOD_SIZE;
     MonitorMode monitor_mode = MonitorMode::DIRECT_ANALOG; // Default to direct analog for zero-latency playing

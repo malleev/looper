@@ -16,6 +16,8 @@
 #include <ctime>
 #include <mutex>
 #include <filesystem>
+#include <algorithm>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 
@@ -131,6 +133,7 @@ void printUsage(const char* prog) {
               << "  -m, --monitor <mode>       Monitor mode: software (default) or analog\n"
               << "  --latency <samples>        Latency compensation in samples (default: 384)\n"
               << "  --pre-roll <samples>       Pre-roll buffer samples (default: 256)\n"
+              << "  --max-seconds <1..300>     Loop capacity (default: 60 seconds)\n"
               << "  --calibrate                Run automatic loopback RTL measurement (OUT 1 -> IN 1) and exit\n"
               << "  -h, --help                 Display this help message\n";
 }
@@ -148,7 +151,17 @@ int main(int argc, char* argv[]) {
     uint32_t latency_compensation = looper::DEFAULT_DIRECT_LATENCY;
     uint32_t pre_roll = looper::PRE_ROLL_SAMPLES;
     bool do_calibrate = false;
+    uint32_t max_seconds = 60;
+    auto number = [](const char* text) -> uint32_t {
+        std::string value(text);
+        if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+            throw std::invalid_argument("Expected a non-negative integer");
+        auto parsed = std::stoull(value);
+        if (parsed > UINT32_MAX) throw std::out_of_range("Number too large");
+        return static_cast<uint32_t>(parsed);
+    };
 
+    try {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
@@ -156,37 +169,52 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (arg == "--calibrate") {
             do_calibrate = true;
+        } else if (arg == "--max-seconds" && i + 1 < argc) {
+            max_seconds = number(argv[++i]);
         } else if ((arg == "-c" || arg == "--capture") && i + 1 < argc) {
             capture_dev = argv[++i];
         } else if ((arg == "-p" || arg == "--playback") && i + 1 < argc) {
             playback_dev = argv[++i];
         } else if (arg == "--rate" && i + 1 < argc) {
-            sample_rate = std::stoul(argv[++i]);
+            sample_rate = number(argv[++i]);
         } else if (arg == "--period" && i + 1 < argc) {
-            period_size = std::stoul(argv[++i]);
+            period_size = number(argv[++i]);
         } else if (arg == "--periods" && i + 1 < argc) {
-            periods = std::stoul(argv[++i]);
+            periods = number(argv[++i]);
         } else if ((arg == "-i" || arg == "--in-channel") && i + 1 < argc) {
-            cap_index = std::stoul(argv[++i]);
+            cap_index = number(argv[++i]);
         } else if (arg == "--capture-channels" && i + 1 < argc) {
-            cap_channels = std::stoul(argv[++i]);
+            cap_channels = number(argv[++i]);
         } else if (arg == "--playback-channels" && i + 1 < argc) {
-            play_channels = std::stoul(argv[++i]);
+            play_channels = number(argv[++i]);
         } else if ((arg == "-m" || arg == "--monitor") && i + 1 < argc) {
             std::string m = argv[++i];
             if (m == "analog" || m == "direct" || m == "DIRECT_ANALOG") {
                 monitor_mode = looper::MonitorMode::DIRECT_ANALOG;
-            } else {
+            } else if (m == "software") {
                 monitor_mode = looper::MonitorMode::SOFTWARE;
+            } else {
+                throw std::invalid_argument("Unknown monitor mode");
             }
         } else if (arg == "--latency" && i + 1 < argc) {
-            latency_compensation = std::stoul(argv[++i]);
+            latency_compensation = number(argv[++i]);
         } else if (arg == "--pre-roll" && i + 1 < argc) {
-            pre_roll = std::stoul(argv[++i]);
+            pre_roll = number(argv[++i]);
         } else if (!arg.empty() && arg[0] != '-') {
             // Positional argument sets both capture and playback (backwards compatibility)
             capture_dev = arg;
+        } else {
+            throw std::invalid_argument("Unknown option or missing value: " + arg);
         }
+    }
+    if (sample_rate != 48000 || !period_size || period_size > 4096 || periods < 2 || periods > 16 ||
+        !cap_channels || cap_channels > 32 || !play_channels || play_channels > 32 || cap_index >= cap_channels ||
+        !max_seconds || max_seconds > 300 || pre_roll > 4096 || latency_compensation > 48000) {
+        throw std::invalid_argument("Invalid audio settings; MVP requires 48000 Hz, capacity 1..300 seconds");
+    }
+    } catch (const std::exception& e) {
+        std::cerr << "[CONFIG] " << e.what() << "\n";
+        return 1;
     }
 
     if (playback_dev.empty()) {
@@ -261,6 +289,9 @@ int main(int argc, char* argv[]) {
     config.fade_out_sec = 3.0f;
     config.latency_compensation = latency_compensation;
     config.pre_roll = pre_roll;
+    config.max_loop_frames = size_t(sample_rate) * max_seconds;
+    std::cout << "Loop capacity: " << max_seconds << " sec; audio buffers: "
+              << (3.0 * config.max_loop_frames * sizeof(float) / 1000000.0) << " MB\n";
 
     // Pure SPSC queues for thread-safe decoupled communication
     looper::ControlQueue ctrl_queue;
@@ -272,7 +303,7 @@ int main(int argc, char* argv[]) {
     // Background worker for non-blocking file I/O
     looper::WavWorker wav_worker(load_queue, return_queue, save_slot_queue, save_ready_queue, [](const std::string& msg, bool is_error) {
         setInfoMessage(msg, is_error ? 3 : 2);
-    });
+    }, config.max_loop_frames);
     wav_worker.start();
 
     // Audio Engine and ALSA device configuration
@@ -407,8 +438,9 @@ int main(int argc, char* argv[]) {
                 } else {
                     auto now = std::time(nullptr);
                     char buf[64];
-                    std::strftime(buf, sizeof(buf), "loop-%Y%m%d-%H%M%S.wav", std::localtime(&now));
-                    std::string path = "recordings/" + std::string(buf);
+                    std::strftime(buf, sizeof(buf), "loop-%Y%m%d-%H%M%S", std::localtime(&now));
+                    auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+                    std::string path = "recordings/" + std::string(buf) + "-" + std::to_string(unique) + ".wav";
                     wav_worker.requestSave(path, s.total_frames, config.sample_rate);
                     setInfoMessage("Saving snapshot: " + path, 2);
                 }

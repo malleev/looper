@@ -1,4 +1,5 @@
 #include "audio_device.hpp"
+#include "audio_math.hpp"
 #include <iostream>
 #include <pthread.h>
 #include <sched.h>
@@ -176,6 +177,11 @@ bool AudioDevice::initSoftwareParams(snd_pcm_t* handle, const PcmParams& params,
         return false;
     }
 
+    if (snd_pcm_sw_params_set_tstamp_mode(handle, sw_params, SND_PCM_TSTAMP_ENABLE) < 0 ||
+        snd_pcm_sw_params_set_tstamp_type(handle, sw_params, SND_PCM_TSTAMP_TYPE_MONOTONIC) < 0) {
+        std::cerr << "[ALSA] Monotonic timestamps are required" << std::endl;
+        return false;
+    }
     // Wake up as soon as 1 full period is ready
     err = snd_pcm_sw_params_set_avail_min(handle, sw_params, params.period_size);
     if (err < 0) {
@@ -402,7 +408,8 @@ void AudioDevice::audioLoop() {
     const size_t cap_idx = audio_config_.capture_channel_index;
 
     constexpr float INT32_TO_FLOAT = 1.0f / 2147483648.0f;
-    constexpr float FLOAT_TO_INT32 = 2147483647.0f;
+    snd_pcm_status_t* capture_status;
+    snd_pcm_status_alloca(&capture_status);
 
     // Prime playback buffer with 2 periods of silence cushion
     if (writeAll(silence_buffer_.data(), period) < 0 || writeAll(silence_buffer_.data(), period) < 0) {
@@ -427,14 +434,26 @@ void AudioDevice::audioLoop() {
             mono_in_[i] = static_cast<float>(in_buffer_[i * cap_channels + cap_idx]) * INT32_TO_FLOAT;
         }
 
-        // snd_pcm_readi unblocks at the end of recording the current block.
-        // Therefore, block_start_ns is read_done_ns minus the block duration in nanoseconds.
+        if (frames_read == 0) continue;
+        // Use a coherent driver timestamp / unread-frame snapshot. A delayed
+        // wake-up can leave more than one period queued behind this block.
         auto t_read_done = std::chrono::steady_clock::now();
-        uint64_t read_done_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t_read_done.time_since_epoch()).count()
-        );
+        int status_err = snd_pcm_status(capture_handle_, capture_status);
+        if (status_err < 0) {
+            if (!recoverDuplex(status_err, SND_PCM_STREAM_CAPTURE)) break;
+            continue;
+        }
+        if (snd_pcm_status_get_state(capture_status) != SND_PCM_STATE_RUNNING) {
+            if (!recoverDuplex(-EPIPE, SND_PCM_STREAM_CAPTURE)) break;
+            continue;
+        }
+        snd_htimestamp_t stamp{};
+        snd_pcm_status_get_htstamp(capture_status, &stamp);
+        const uint64_t stamp_ns = uint64_t(stamp.tv_sec) * 1000000000ULL + stamp.tv_nsec;
+        if (stamp_ns == 0) { telemetry_.fatal_audio_errors.fetch_add(1); break; }
         uint64_t block_duration_ns = (static_cast<uint64_t>(frames_read) * 1000000000ULL) / capture_params_.sample_rate;
-        uint64_t block_start_ns = (read_done_ns > block_duration_ns) ? (read_done_ns - block_duration_ns) : 0;
+        uint64_t block_start_ns = captureBlockStart(stamp_ns,
+            snd_pcm_status_get_avail(capture_status), frames_read, capture_params_.sample_rate);
 
         // Process audio in LooperEngine with sample-accurate timestamp mapping
         engine_.process(mono_in_.data(), stereo_out_left_.data(), stereo_out_right_.data(),
@@ -459,9 +478,9 @@ void AudioDevice::audioLoop() {
         for (size_t i = 0; i < static_cast<size_t>(frames_read); ++i) {
             float l = std::clamp(stereo_out_left_[i], -1.0f, 1.0f);
             float r = std::clamp(stereo_out_right_[i], -1.0f, 1.0f);
-            out_buffer_[i * play_channels + 0] = static_cast<int32_t>(l * FLOAT_TO_INT32);
+            out_buffer_[i * play_channels + 0] = floatToPcm32(l);
             if (play_channels > 1) {
-                out_buffer_[i * play_channels + 1] = static_cast<int32_t>(r * FLOAT_TO_INT32);
+                out_buffer_[i * play_channels + 1] = floatToPcm32(r);
             }
             for (size_t ch = 2; ch < play_channels; ++ch) {
                 out_buffer_[i * play_channels + ch] = 0;

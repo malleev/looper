@@ -2,6 +2,7 @@
 #include "wav_file.hpp"
 #include <iostream>
 #include <chrono>
+#include <memory>
 
 namespace looper {
 
@@ -9,12 +10,12 @@ WavWorker::WavWorker(LoadQueue& load_queue,
                      BufferReturnQueue& return_queue,
                      SaveSlotQueue& save_slot_queue,
                      SaveReadyQueue& save_ready_queue,
-                     StatusCallback callback)
+                     StatusCallback callback, size_t max_loop_frames)
     : load_queue_(load_queue),
       return_queue_(return_queue),
       save_slot_queue_(save_slot_queue),
       save_ready_queue_(save_ready_queue),
-      callback_(std::move(callback)) {
+      callback_(std::move(callback)), max_loop_frames_(max_loop_frames) {
 }
 
 WavWorker::~WavWorker() {
@@ -83,24 +84,23 @@ void WavWorker::workerLoop() {
             }
         }
 
-        if (has_task) {
+        if (has_task) try {
             if (task.is_save) {
                 if (task.loop_length == 0) {
                     if (callback_) callback_("Cannot save: loop is empty", true);
-                } else if (task.loop_length > MAX_LOOP_FRAMES) {
+                } else if (task.loop_length > max_loop_frames_) {
                     if (callback_) callback_("Cannot save: loop exceeds max frames", true);
                 } else {
                     // Allocate staging buffer on worker thread
-                    auto* save_buf = new std::vector<float>();
-                    save_buf->reserve(task.loop_length);
-                    save_buf->resize(task.loop_length);
+                    auto staging = std::make_unique<std::vector<float>>(task.loop_length);
+                    auto* save_buf = staging.get();
 
                     SaveSlotCommand slot;
                     slot.buffer = save_buf;
                     if (!save_slot_queue_.push(slot)) {
-                        delete save_buf; // Clean up immediately if queue is full
                         if (callback_) callback_("Save failed: engine queue full", true);
                     } else {
+                        staging.release();
                         // Ownership transferred to engine.
                         // Strict ownership: worker MUST wait for engine to return buffer via save_ready_queue_!
                         // Worker NEVER deletes save_buf directly on timeout to prevent UAF.
@@ -131,28 +131,26 @@ void WavWorker::workerLoop() {
                 // Load task
                 std::vector<float> loaded;
                 std::string err;
-                if (WavFile::load(task.filepath, loaded, task.sample_rate, err)) {
-                    if (loaded.size() > MAX_LOOP_FRAMES) {
-                        if (callback_) callback_("Load error: WAV file exceeds 5 min max", true);
+                if (WavFile::load(task.filepath, loaded, task.sample_rate, err, max_loop_frames_)) {
+                    if (loaded.size() > max_loop_frames_) {
+                        if (callback_) callback_("Load error: WAV exceeds configured capacity", true);
                     } else {
                         size_t file_frames = loaded.size();
-                        auto* new_base = new std::vector<float>(MAX_LOOP_FRAMES, 0.0f);
+                        auto new_base = std::make_unique<std::vector<float>>(max_loop_frames_, 0.0f);
                         std::copy(loaded.begin(), loaded.end(), new_base->begin());
 
-                        auto* new_layer = new std::vector<float>(MAX_LOOP_FRAMES, 0.0f);
-                        auto* new_record = new std::vector<float>(MAX_LOOP_FRAMES, 0.0f);
+                        auto new_layer = std::make_unique<std::vector<float>>(max_loop_frames_, 0.0f);
+                        auto new_record = std::make_unique<std::vector<float>>(max_loop_frames_, 0.0f);
 
                         LoadCommand cmd;
-                        cmd.base_buffer = new_base;
-                        cmd.layer_buffer = new_layer;
-                        cmd.record_buffer = new_record;
+                        cmd.base_buffer = new_base.get();
+                        cmd.layer_buffer = new_layer.get();
+                        cmd.record_buffer = new_record.get();
                         cmd.loop_length = file_frames;
                         if (!load_queue_.push(cmd)) {
-                            delete new_base; // Clean up on push failure
-                            delete new_layer;
-                            delete new_record;
                             if (callback_) callback_("Load error: engine load queue full", true);
                         } else {
+                            new_base.release(); new_layer.release(); new_record.release();
                             if (callback_) callback_("Loaded: " + task.filepath, false);
                         }
                     }
@@ -160,6 +158,8 @@ void WavWorker::workerLoop() {
                     if (callback_) callback_("Load error: " + err, true);
                 }
             }
+        } catch (const std::exception& e) {
+            if (callback_) callback_(std::string("File operation failed: ") + e.what(), true);
         }
     }
 
@@ -171,6 +171,13 @@ void WavWorker::workerLoop() {
     while (save_ready_queue_.pop(leftover)) {
         delete leftover;
     }
+    // stop() must be called after the audio consumer has stopped.
+    LoadCommand pending_load;
+    while (load_queue_.pop(pending_load)) {
+        delete pending_load.base_buffer; delete pending_load.layer_buffer; delete pending_load.record_buffer;
+    }
+    SaveSlotCommand pending_save;
+    while (save_slot_queue_.pop(pending_save)) delete pending_save.buffer;
 }
 
 } // namespace looper

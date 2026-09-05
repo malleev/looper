@@ -20,7 +20,7 @@ public:
               BufferReturnQueue& return_queue,
               SaveSlotQueue& save_slot_queue,
               SaveReadyQueue& save_ready_queue,
-              StatusCallback callback);
+              StatusCallback callback, size_t max_loop_frames = MAX_LOOP_FRAMES);
     ~WavWorker();
 
     void start();
@@ -45,6 +45,7 @@ private:
     SaveSlotQueue& save_slot_queue_;
     SaveReadyQueue& save_ready_queue_;
     StatusCallback callback_;
+    const size_t max_loop_frames_;
 
     std::thread worker_thread_;
     std::mutex mutex_;

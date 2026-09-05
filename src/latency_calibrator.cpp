@@ -156,7 +156,8 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
     uint64_t total_played_samples = 2 * period;
     uint64_t total_recorded_samples = 0;
 
-    int err = snd_pcm_start(cap_handle);
+    // Linked capture may already have been started by playback's threshold.
+    int err = snd_pcm_state(cap_handle) == SND_PCM_STATE_RUNNING ? 0 : snd_pcm_start(cap_handle);
     if (err < 0) {
         res.message = "Failed to start capture PCM stream: " + std::string(snd_strerror(err));
         if (is_linked) snd_pcm_unlink(cap_handle);

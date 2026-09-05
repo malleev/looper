@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 
 namespace looper {
 
@@ -21,16 +22,24 @@ LooperEngine::LooperEngine(ControlQueue& ctrl_queue,
       latency_compensation_(config.latency_compensation),
       monitor_mode_(config.monitor_mode),
       status_loop_gain_(config.loop_gain) {
-    base_track_ptr_ = new std::vector<float>(MAX_LOOP_FRAMES, 0.0f);
-    last_layer_ptr_ = new std::vector<float>(MAX_LOOP_FRAMES, 0.0f);
-    record_layer_ptr_ = new std::vector<float>(MAX_LOOP_FRAMES, 0.0f);
+    if (config_.max_loop_frames == 0 || config_.max_loop_frames > MAX_LOOP_FRAMES ||
+        config_.pre_roll >= config_.max_loop_frames) {
+        throw std::invalid_argument("Invalid loop capacity / pre-roll");
+    }
+    auto base = std::make_unique<std::vector<float>>(config_.max_loop_frames, 0.0f);
+    auto last = std::make_unique<std::vector<float>>(config_.max_loop_frames, 0.0f);
+    auto record = std::make_unique<std::vector<float>>(config_.max_loop_frames, 0.0f);
 
     if (config_.pre_roll > 0) {
         pre_roll_buffer_.assign(config_.pre_roll, 0.0f);
     }
+    base_track_ptr_ = base.release();
+    last_layer_ptr_ = last.release();
+    record_layer_ptr_ = record.release();
 }
 
 LooperEngine::~LooperEngine() {
+    delete active_save_buf_;
     delete base_track_ptr_;
     base_track_ptr_ = nullptr;
     delete last_layer_ptr_;
@@ -49,6 +58,7 @@ LooperEngine::~LooperEngine() {
 
 void LooperEngine::process(const float* in, float* out_left, float* out_right, size_t nframes,
                            uint64_t block_start_ns, uint64_t block_duration_ns) {
+    if (nframes == 0) return;
     // 1. Process pending Load and SaveSlot commands at block boundary
     processLoadAndSaveCommands();
 
@@ -107,7 +117,7 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     }
 
     // 4. Collect and map pending control commands to sample offsets (Sample-Accurate Footswitch)
-    ControlCommand pending_cmds[32];
+    ControlCommand pending_cmds[MAX_DEFERRED_CMDS];
     size_t num_cmds = 0;
 
     // Load commands deferred from previous blocks
@@ -116,7 +126,7 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     }
     deferred_count_ = 0;
 
-    while (num_cmds < 32 && ctrl_queue_.pop(pending_cmds[num_cmds])) {
+    while (num_cmds < MAX_DEFERRED_CMDS && ctrl_queue_.pop(pending_cmds[num_cmds])) {
         num_cmds++;
     }
 
@@ -209,11 +219,17 @@ void LooperEngine::processAudioSlice(const float* in, float* out_left, float* ou
         float right = in_sample * dry_gain;
 
         if (current_state == LooperState::RECORDING) {
-            if (loop_length_ < MAX_LOOP_FRAMES) {
+            if (loop_length_ < config_.max_loop_frames) {
                 (*base_track_ptr_)[loop_length_] = in_sample;
                 (*last_layer_ptr_)[loop_length_] = 0.0f;
                 (*record_layer_ptr_)[loop_length_] = 0.0f;
                 loop_length_++;
+                if (loop_length_ == config_.max_loop_frames) {
+                    applyLoopSeamCrossfade(base_track_ptr_);
+                    playhead_ = 0;
+                    current_state = LooperState::PLAYING;
+                    state_.store(current_state, std::memory_order_release);
+                }
             }
         } else if (current_state == LooperState::PLAYING || current_state == LooperState::OVERDUB) {
             if (loop_length_ > 0) {
@@ -243,6 +259,7 @@ void LooperEngine::processAudioSlice(const float* in, float* out_left, float* ou
                         loop_sample *= fade_mult;
                         --fade_out_remaining_frames_;
                     } else {
+                        loop_sample = 0.0f;
                         is_fading_out_.store(false, std::memory_order_relaxed);
                         state_.store(LooperState::STOPPED, std::memory_order_release);
                         current_state = LooperState::STOPPED;
@@ -296,6 +313,7 @@ void LooperEngine::abortActiveSave() {
 }
 
 void LooperEngine::commitOverdubTake() {
+    applyLoopSeamCrossfade(record_layer_ptr_);
     if (merge_layer_ptr_) {
         if (!pending_merge_active_) {
             last_layer_ptr_ = record_layer_ptr_;
@@ -346,7 +364,7 @@ void LooperEngine::executeControlCommand(const ControlCommand& cmd) {
                         size_t buf_len = pre_roll_buffer_.size();
                         size_t n = std::min(static_cast<size_t>(config_.pre_roll), buf_len);
                         size_t start_pos = (pre_roll_idx_ + buf_len - n) % buf_len;
-                        for (size_t i = 0; i < n && loop_length_ < MAX_LOOP_FRAMES; ++i) {
+                        for (size_t i = 0; i < n && loop_length_ < config_.max_loop_frames; ++i) {
                             (*base_track_ptr_)[loop_length_] = pre_roll_buffer_[(start_pos + i) % buf_len];
                             (*last_layer_ptr_)[loop_length_] = 0.0f;
                             (*record_layer_ptr_)[loop_length_] = 0.0f;
@@ -364,7 +382,7 @@ void LooperEngine::executeControlCommand(const ControlCommand& cmd) {
                         if (config_.pre_roll > 0 && loop_length_ > config_.pre_roll) {
                             loop_length_ -= config_.pre_roll;
                         }
-                        applyLoopSeamCrossfade();
+                        applyLoopSeamCrossfade(base_track_ptr_);
                         playhead_ = 0;
                         overdub_frames_recorded_ = 0;
                         pending_merge_active_ = false;
@@ -421,7 +439,7 @@ void LooperEngine::executeControlCommand(const ControlCommand& cmd) {
                     if (config_.pre_roll > 0 && loop_length_ > config_.pre_roll) {
                         loop_length_ -= config_.pre_roll;
                     }
-                    applyLoopSeamCrossfade();
+                    applyLoopSeamCrossfade(base_track_ptr_);
                     playhead_ = 0;
                     overdub_frames_recorded_ = 0;
                     pending_merge_active_ = false;
@@ -519,6 +537,8 @@ void LooperEngine::executeControlCommand(const ControlCommand& cmd) {
             if (current == LooperState::OVERDUB) break;
 
             auto new_mode = static_cast<MonitorMode>(cmd.int_param);
+            if (new_mode != MonitorMode::SOFTWARE && new_mode != MonitorMode::DIRECT_ANALOG) break;
+            config_.dry_gain = (new_mode == MonitorMode::SOFTWARE) ? 1.0f : 0.0f;
             monitor_mode_.store(new_mode, std::memory_order_relaxed);
             break;
         }
@@ -549,7 +569,7 @@ void LooperEngine::executeControlCommand(const ControlCommand& cmd) {
 void LooperEngine::processLoadAndSaveCommands() {
     // 1. Process Load commands from WavWorker (pure pointer swap: 0 malloc/free, 0 array loops in audio thread)
     LoadCommand load_cmd;
-    while (load_queue_.pop(load_cmd)) {
+    if (!overflow_return_buf_ && !overflow_return_buf2_ && !overflow_return_buf3_ && load_queue_.pop(load_cmd)) {
         if (load_cmd.base_buffer && load_cmd.layer_buffer && load_cmd.record_buffer) {
             abortActiveSave();
             pending_merge_active_ = false;
@@ -578,11 +598,14 @@ void LooperEngine::processLoadAndSaveCommands() {
                 if (!overflow_return_buf3_) overflow_return_buf3_ = old_record;
             }
 
-            loop_length_ = std::min((load_cmd.loop_length > 0) ? load_cmd.loop_length : base_track_ptr_->size(), MAX_LOOP_FRAMES);
+            loop_length_ = std::min({(load_cmd.loop_length > 0) ? load_cmd.loop_length : base_track_ptr_->size(),
+                                    base_track_ptr_->size(), last_layer_ptr_->size(),
+                                    record_layer_ptr_->size(), config_.max_loop_frames});
             playhead_ = 0;
             has_undo_layer_ = false;
             is_undone_ = false;
             overdub_frames_recorded_ = 0;
+            is_fading_out_.store(false, std::memory_order_relaxed);
             undo_available_.store(false, std::memory_order_relaxed);
             redo_available_.store(false, std::memory_order_relaxed);
             state_.store(LooperState::STOPPED, std::memory_order_release);
@@ -608,13 +631,14 @@ void LooperEngine::processLoadAndSaveCommands() {
 
     // 3. Process Save snapshot slot commands from WavWorker
     SaveSlotCommand slot_cmd;
-    while (save_slot_queue_.pop(slot_cmd)) {
+    while (!active_save_buf_ && save_slot_queue_.pop(slot_cmd)) {
         if (slot_cmd.buffer) {
             LooperState current = state_.load(std::memory_order_relaxed);
             // Allow save snapshot only when STOPPED and loop exists
-            if (current == LooperState::STOPPED && base_track_ptr_ && loop_length_ > 0) {
+            if (current == LooperState::STOPPED && base_track_ptr_ && loop_length_ > 0 &&
+                slot_cmd.buffer->size() >= loop_length_) {
                 active_save_buf_ = slot_cmd.buffer;
-                save_copy_total_ = std::min(loop_length_, active_save_buf_->capacity());
+                save_copy_total_ = loop_length_;
                 active_save_buf_->resize(save_copy_total_);
                 save_copy_progress_ = 0;
             } else {
@@ -630,19 +654,19 @@ void LooperEngine::processLoadAndSaveCommands() {
     }
 }
 
-void LooperEngine::applyLoopSeamCrossfade() {
-    if (!base_track_ptr_ || loop_length_ < 2) return;
+void LooperEngine::applyLoopSeamCrossfade(std::vector<float>* track) {
+    if (!track || loop_length_ < 2) return;
     size_t xfade_len = std::min(static_cast<size_t>(config_.crossfade_samples), loop_length_ / 2);
     if (xfade_len == 0) return;
 
-    size_t end_start = loop_length_ - xfade_len;
-
+    // Bridge both endpoints to their mean, tapering the correction to zero.
+    // Keeps loop length, DC and interior samples intact, in either direction.
+    const float correction = ((*track)[loop_length_ - 1] - (*track)[0]) * 0.5f;
     for (size_t i = 0; i < xfade_len; ++i) {
-        float alpha = static_cast<float>(i) / static_cast<float>(xfade_len);
-        float start_sample = (*base_track_ptr_)[i];
-        float end_sample = (*base_track_ptr_)[end_start + i];
-
-        (*base_track_ptr_)[i] = (start_sample * alpha) + (end_sample * (1.0f - alpha));
+        float weight = xfade_len > 1 ? 1.0f - static_cast<float>(i) / (xfade_len - 1) : 1.0f;
+        weight = weight * weight * (3.0f - 2.0f * weight);
+        (*track)[i] += correction * weight;
+        (*track)[loop_length_ - 1 - i] -= correction * weight;
     }
 }
 
