@@ -13,7 +13,7 @@ constexpr uint32_t DEFAULT_CHANNELS = 4;      // MiniFuse 1 requires 4 HW channe
 constexpr uint32_t CROSSFADE_SAMPLES = 240;   // 5 ms crossfade at 48kHz to prevent clicks
 constexpr uint32_t DEFAULT_DIRECT_LATENCY = 384; // Configured test default for MiniFuse 1 Direct Analog Monitoring
 constexpr uint32_t PRE_ROLL_SAMPLES = 256;    // Pre-record rolling buffer (~5.3 ms) to catch note attack
-constexpr size_t MAX_LOOP_FRAMES = 48000 * 60 * 10; // 10 minutes max loop buffer
+constexpr size_t MAX_LOOP_FRAMES = 48000 * 60 * 5; // 5 minutes max loop buffer (57.6 MB per layer, 172.8 MB for 3 layers)
 
 enum class LooperState {
     IDLE,       // No loop recorded, passthrough live audio

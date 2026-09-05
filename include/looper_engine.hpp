@@ -55,19 +55,19 @@ private:
     // Pre-allocated loop buffers (owned and accessed exclusively by real-time audio thread)
     std::vector<float>* base_track_ptr_{nullptr};
     std::vector<float>* last_layer_ptr_{nullptr};
+    std::vector<float>* record_layer_ptr_{nullptr};
     bool has_undo_layer_{false};
     bool is_undone_{false};
 
-    // Incremental overdub tracking in transport domain
+    // Live overdub session state
     size_t overdub_frames_recorded_{0};
-    size_t last_overdub_comp_playhead_{0};
-    bool merge_old_layer_to_base_{false};
 
-    // Background chunked merge in transport domain
+    // Background chunked merge of previous last_layer into base_track
+    static constexpr size_t MERGE_CHUNK_SIZE = 8192;
     bool pending_merge_active_{false};
-    size_t pending_merge_playhead_{0};
+    size_t pending_merge_idx_{0};
     size_t pending_merge_frames_{0};
-    bool pending_merge_is_reversed_{false};
+    bool merge_last_to_base_{false};
 
     // Chunked non-blocking WAV save snapshot state
     static constexpr size_t SAVE_CHUNK_SIZE = 16384;
@@ -78,6 +78,7 @@ private:
     // Overflow return buffer fallbacks in case return queue is momentarily full
     std::vector<float>* overflow_return_buf_{nullptr};
     std::vector<float>* overflow_return_buf2_{nullptr};
+    std::vector<float>* overflow_return_buf3_{nullptr};
 
     // Rolling circular pre-roll buffer
     std::vector<float> pre_roll_buffer_;

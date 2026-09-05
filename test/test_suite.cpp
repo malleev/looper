@@ -600,24 +600,306 @@ void test_save_interrupted_by_clear_and_load() {
     assert(ready_buf->empty()); // Empty marks aborted save
     delete save_buf;
 
-    // 4. Test LoadCommand dual pointer swap
+    // 4. Test LoadCommand 3-buffer pointer swap
     auto* new_base = new std::vector<float>(256, 0.7f);
     auto* new_layer = new std::vector<float>(256, 0.0f);
+    auto* new_record = new std::vector<float>(256, 0.0f);
     LoadCommand lcmd;
     lcmd.base_buffer = new_base;
     lcmd.layer_buffer = new_layer;
+    lcmd.record_buffer = new_record;
     load_queue.push(lcmd);
 
     engine.process(in.data(), out_l.data(), out_r.data(), 128);
     assert(engine.getStatus().state == LooperState::STOPPED);
     assert(engine.getStatus().total_frames == 256);
 
-    // Check that old buffers were pushed to return queue for worker
+    // Check that all 3 old buffers were pushed to return queue for worker
     std::vector<float>* returned_buf = nullptr;
     assert(return_queue.pop(returned_buf));
     delete returned_buf;
     assert(return_queue.pop(returned_buf));
     delete returned_buf;
+    assert(return_queue.pop(returned_buf));
+    delete returned_buf;
+
+    std::cout << "PASSED!" << std::endl;
+}
+
+void test_wav_save_includes_active_overdub() {
+    std::cout << "[TEST] WAV Save Snapshot Includes Active Overdub (0.5 + 0.3 = 0.8)... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+    config.latency_compensation = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.5f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // 1. Record 2 blocks (256 samples) of 0.5f base loop
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+
+    // 2. Close recording -> PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().total_frames == 256);
+
+    // 3. Enter OVERDUB, record 2 blocks (256 samples) of 0.3f
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.3f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+
+    // 4. End OVERDUB -> PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // Verify audible playback is 0.5f + 0.3f = 0.8f
+    for (int i = 0; i < 128; ++i) {
+        assert(std::abs(out_l[i] - 0.8f) < 0.01f);
+    }
+
+    // 5. STOP
+    cmd.type = ControlCommandType::STOP;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::STOPPED);
+
+    // 6. Request save snapshot
+    auto* save_buf = new std::vector<float>(256);
+    SaveSlotCommand slot;
+    slot.buffer = save_buf;
+    save_slot_queue.push(slot);
+
+    // Process blocks until save is ready
+    std::vector<float>* ready_buf = nullptr;
+    while (!save_ready_queue.pop(ready_buf)) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    assert(ready_buf == save_buf);
+    assert(ready_buf->size() == 256);
+    // Verify saved WAV contains 0.8f (0.5 base + 0.3 overdub)
+    for (size_t i = 0; i < ready_buf->size(); ++i) {
+        assert(std::abs((*ready_buf)[i] - 0.8f) < 0.01f);
+    }
+    delete ready_buf;
+
+    // 7. Test UNDO then save: should contain only 0.5f
+    cmd.type = ControlCommandType::UNDO_REDO;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().undo_available == false);
+    assert(engine.getStatus().redo_available == true);
+
+    save_buf = new std::vector<float>(256);
+    slot.buffer = save_buf;
+    save_slot_queue.push(slot);
+
+    ready_buf = nullptr;
+    while (!save_ready_queue.pop(ready_buf)) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    assert(ready_buf == save_buf);
+    for (size_t i = 0; i < ready_buf->size(); ++i) {
+        assert(std::abs((*ready_buf)[i] - 0.5f) < 0.01f);
+    }
+    delete ready_buf;
+
+    std::cout << "PASSED!" << std::endl;
+}
+
+void test_large_loop_partial_overdub_and_undo() {
+    std::cout << "[TEST] Large Loop (16384 samples) Partial Overdub, Undo/Redo & Ghost Prevention... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+    config.latency_compensation = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.4f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // 1. Record 128 blocks * 128 = 16384 samples base loop with 0.4f
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    for (int i = 0; i < 128; ++i) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    // End recording -> PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().total_frames == 16384);
+
+    // Wrap around playhead to 0 by running remaining 127 blocks
+    for (int i = 0; i < 127; ++i) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    assert(engine.getStatus().playhead_frames == 0);
+
+    // 2. Overdub 1 block (128 samples) with 0.2f at beginning of loop
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.2f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+
+    // End overdub -> PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    std::fill(in.begin(), in.end(), 0.0f);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // Advance through the entire loop to verify:
+    // Run remaining 126 blocks: all should be 0.4f
+    for (int i = 0; i < 126; ++i) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+        assert(std::abs(out_l[0] - 0.4f) < 0.01f);
+    }
+
+    // Now playhead reaches block 0 again: should be 0.4f + 0.2f = 0.6f
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(std::abs(out_l[0] - 0.6f) < 0.01f);
+
+    // 3. Test UNDO
+    cmd.type = ControlCommandType::UNDO_REDO;
+    ctrl_queue.push(cmd);
+    // Next block is block 1 (0.4f)
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().undo_available == false);
+
+    // Advance until block 0 again
+    for (int i = 0; i < 126; ++i) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    // Block 0 with UNDO should be 0.4f
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(std::abs(out_l[0] - 0.4f) < 0.01f);
+
+    // 4. Test REDO
+    cmd.type = ControlCommandType::UNDO_REDO;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().undo_available == true);
+
+    // Advance until block 0 again
+    for (int i = 0; i < 126; ++i) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    // Block 0 with REDO should be 0.6f
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(std::abs(out_l[0] - 0.6f) < 0.01f);
+
+    std::cout << "PASSED!" << std::endl;
+}
+
+void test_overdub_mode_locks() {
+    std::cout << "[TEST] Mode / Transport Switches Disallowed in OVERDUB... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+    config.latency_compensation = 384;
+    config.monitor_mode = MonitorMode::DIRECT_ANALOG;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.5f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // Record base loop & enter PLAYING
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // Enter OVERDUB
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::OVERDUB);
+
+    // Try TOGGLE_REVERSE in OVERDUB -> must be ignored!
+    cmd.type = ControlCommandType::TOGGLE_REVERSE;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().is_reversed == false);
+
+    // Try SET_MONITOR_MODE in OVERDUB -> must be ignored!
+    cmd.type = ControlCommandType::SET_MONITOR_MODE;
+    cmd.int_param = static_cast<int>(MonitorMode::SOFTWARE);
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().monitor_mode == MonitorMode::DIRECT_ANALOG);
+
+    // Try ADJUST_LATENCY in OVERDUB -> must be ignored!
+    cmd.type = ControlCommandType::ADJUST_LATENCY;
+    cmd.int_param = 50;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().configured_latency_samples == 384);
+
+    // End overdub -> PLAYING
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+
+    // Now in PLAYING, TOGGLE_REVERSE should work!
+    cmd.type = ControlCommandType::TOGGLE_REVERSE;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().is_reversed == true);
 
     std::cout << "PASSED!" << std::endl;
 }
@@ -637,8 +919,11 @@ int main() {
     test_partial_overdub_with_latency();
     test_undo_then_partial_new_overdub();
     test_save_interrupted_by_clear_and_load();
+    test_wav_save_includes_active_overdub();
+    test_large_loop_partial_overdub_and_undo();
+    test_overdub_mode_locks();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (10/10)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (13/13)" << std::endl;
     return 0;
 }
 
