@@ -43,7 +43,12 @@ private:
     KeyCallback callback_;
     std::thread worker_thread_;
     std::atomic<bool> running_{false};
-    std::vector<int> evdev_fds_;
+
+    struct EvdevDevice {
+        int fd{-1};
+        bool monotonic_timestamp{false};
+    };
+    std::vector<EvdevDevice> evdev_devices_;
 };
 
 } // namespace looper

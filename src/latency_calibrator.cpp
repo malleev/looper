@@ -121,6 +121,14 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
         return res;
     }
 
+    // Attempt hardware-synchronized linking if driver/device supports it
+    bool is_linked = (snd_pcm_link(cap_handle, play_handle) == 0);
+    if (is_linked) {
+        std::cout << "[CALIBRATOR] Linked capture and playback streams via snd_pcm_link." << std::endl;
+    } else {
+        std::cout << "[CALIBRATOR] Note: snd_pcm_link unsupported by device; using synchronized duplex start." << std::endl;
+    }
+
     std::vector<int32_t> in_buf(period * cap_ch, 0);
     std::vector<int32_t> pulse_buf(period * play_ch, 0);
     std::vector<int32_t> silence_buf(period * play_ch, 0);
@@ -139,6 +147,7 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
     if (!writeAll(play_handle, silence_buf.data(), period, play_ch) ||
         !writeAll(play_handle, silence_buf.data(), period, play_ch)) {
         res.message = "Failed to prime playback buffer with silence cushion";
+        if (is_linked) snd_pcm_unlink(cap_handle);
         snd_pcm_close(cap_handle);
         snd_pcm_close(play_handle);
         return res;
@@ -150,6 +159,7 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
     int err = snd_pcm_start(cap_handle);
     if (err < 0) {
         res.message = "Failed to start capture PCM stream: " + std::string(snd_strerror(err));
+        if (is_linked) snd_pcm_unlink(cap_handle);
         snd_pcm_close(cap_handle);
         snd_pcm_close(play_handle);
         return res;
@@ -169,6 +179,8 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
     constexpr int WARMUP_PERIODS = 20;   // ~53 ms at 48kHz / 128
     constexpr int COOLDOWN_PERIODS = 20; // ~53 ms between pulses
     constexpr int TIMEOUT_PERIODS = 120; // ~320 ms timeout per pulse
+    constexpr uint32_t MAX_ATTEMPTS = 10;
+    uint32_t attempts = 0;
 
     uint64_t pulse_playback_sample = 0;
 
@@ -178,6 +190,20 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
         snd_pcm_sframes_t r = snd_pcm_readi(cap_handle, in_buf.data(), period);
         if (r < 0) {
             res.message = "ALSA read error during calibration: " + std::string(snd_strerror(static_cast<int>(r)));
+            if (is_linked) snd_pcm_unlink(cap_handle);
+            snd_pcm_drop(cap_handle);
+            snd_pcm_drop(play_handle);
+            snd_pcm_close(cap_handle);
+            snd_pcm_close(play_handle);
+            return res;
+        }
+
+        // Strict validation: short reads would corrupt timeline alignment
+        if (r != static_cast<snd_pcm_sframes_t>(period)) {
+            res.success = false;
+            res.message = "ALSA short read during calibration: expected " + std::to_string(period) +
+                          " frames, got " + std::to_string(r);
+            if (is_linked) snd_pcm_unlink(cap_handle);
             snd_pcm_drop(cap_handle);
             snd_pcm_drop(play_handle);
             snd_pcm_close(cap_handle);
@@ -190,7 +216,6 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
 
         if (state == CalState::WARMUP) {
             if (++state_counter >= WARMUP_PERIODS) {
-                // Emit pulse on next playback write
                 emit_pulse_now = true;
                 state = CalState::WAITING_FOR_RESPONSE;
                 state_counter = 0;
@@ -207,12 +232,22 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
                 if (pulse_capture_sample >= pulse_playback_sample) {
                     uint32_t rtl = static_cast<uint32_t>(pulse_capture_sample - pulse_playback_sample);
                     measurements.push_back(rtl);
+                    state = CalState::COOLDOWN;
+                    state_counter = 0;
+                } else {
+                    res.success = false;
+                    res.message = "Capture/playback timelines are not synchronized: pulse captured before emission.";
+                    if (is_linked) snd_pcm_unlink(cap_handle);
+                    snd_pcm_drop(cap_handle);
+                    snd_pcm_drop(play_handle);
+                    snd_pcm_close(cap_handle);
+                    snd_pcm_close(play_handle);
+                    return res;
                 }
-                state = CalState::COOLDOWN;
-                state_counter = 0;
             } else if (++state_counter >= TIMEOUT_PERIODS) {
                 res.success = false;
                 res.message = "No loopback signal detected. Connect Audio Output 1 to Audio Input 1 and verify cable / gain.";
+                if (is_linked) snd_pcm_unlink(cap_handle);
                 snd_pcm_drop(cap_handle);
                 snd_pcm_drop(play_handle);
                 snd_pcm_close(cap_handle);
@@ -232,13 +267,25 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
         total_recorded_samples += r;
 
         // 3. Write one period to playback (lockstep pairing)
-        const int32_t* out_data = emit_pulse_now ? pulse_buf.data() : silence_buf.data();
         if (emit_pulse_now) {
+            if (++attempts > MAX_ATTEMPTS) {
+                res.success = false;
+                res.message = "Calibration failed: exceeded maximum pulse attempts (" + std::to_string(MAX_ATTEMPTS) +
+                              "). Timelines may not be synchronized.";
+                if (is_linked) snd_pcm_unlink(cap_handle);
+                snd_pcm_drop(cap_handle);
+                snd_pcm_drop(play_handle);
+                snd_pcm_close(cap_handle);
+                snd_pcm_close(play_handle);
+                return res;
+            }
             pulse_playback_sample = total_played_samples;
         }
 
+        const int32_t* out_data = emit_pulse_now ? pulse_buf.data() : silence_buf.data();
         if (!writeAll(play_handle, out_data, period, play_ch)) {
             res.message = "ALSA write error during calibration";
+            if (is_linked) snd_pcm_unlink(cap_handle);
             snd_pcm_drop(cap_handle);
             snd_pcm_drop(play_handle);
             snd_pcm_close(cap_handle);
@@ -249,6 +296,7 @@ CalibrationResult LatencyCalibrator::run(const AudioConfig& audio_cfg, uint32_t 
         total_played_samples += period;
     }
 
+    if (is_linked) snd_pcm_unlink(cap_handle);
     snd_pcm_drop(cap_handle);
     snd_pcm_drop(play_handle);
     snd_pcm_close(cap_handle);

@@ -40,8 +40,12 @@ void InputManager::scanEvdevDevices() {
                                   << " (" << path << ")" << std::endl;
                         // Align evdev event timestamps with CLOCK_MONOTONIC / std::chrono::steady_clock
                         unsigned int clk = CLOCK_MONOTONIC;
-                        ioctl(fd, EVIOCSCLOCKID, &clk);
-                        evdev_fds_.push_back(fd);
+                        bool mono = (ioctl(fd, EVIOCSCLOCKID, &clk) == 0);
+                        if (!mono) {
+                            std::cerr << "[INPUT] Warning: EVIOCSCLOCKID failed on " << path 
+                                      << ", fallback to steady_clock for timestamps." << std::endl;
+                        }
+                        evdev_devices_.push_back(EvdevDevice{fd, mono});
                         continue;
                     }
                 }
@@ -69,10 +73,10 @@ void InputManager::stop() {
         worker_thread_.join();
     }
 
-    for (int fd : evdev_fds_) {
-        close(fd);
+    for (const auto& dev : evdev_devices_) {
+        close(dev.fd);
     }
-    evdev_fds_.clear();
+    evdev_devices_.clear();
 }
 
 void InputManager::workerLoop() {
@@ -98,9 +102,9 @@ void InputManager::workerLoop() {
             pfd.push_back(p);
         }
 
-        for (int fd : evdev_fds_) {
+        for (const auto& dev : evdev_devices_) {
             struct pollfd p;
-            p.fd = fd;
+            p.fd = dev.fd;
             p.events = POLLIN;
             p.revents = 0;
             pfd.push_back(p);
@@ -146,8 +150,11 @@ void InputManager::workerLoop() {
         }
 
         // 2. Check evdev (physical USB keyboard)
+        size_t evdev_base_idx = has_tty ? 1 : 0;
         for (; idx < pfd.size(); ++idx) {
             if (pfd[idx].revents & POLLIN) {
+                size_t dev_idx = idx - evdev_base_idx;
+                const auto& dev = evdev_devices_[dev_idx];
                 struct input_event ev;
                 while (read(pfd[idx].fd, &ev, sizeof(ev)) == sizeof(ev)) {
                     if (ev.type == EV_KEY && ev.value == 1) { // Key down
@@ -170,9 +177,12 @@ void InputManager::workerLoop() {
                             default: break;
                         }
                         if (ak != ActionKey::NONE && callback_) {
-                            // Extract kernel hardware timestamp from evdev event (CLOCK_MONOTONIC)
-                            uint64_t ts_ns = static_cast<uint64_t>(ev.input_event_sec) * 1000000000ULL +
-                                             static_cast<uint64_t>(ev.input_event_usec) * 1000ULL;
+                            uint64_t ts_ns = 0;
+                            // Only use kernel timestamp if EVIOCSCLOCKID CLOCK_MONOTONIC was verified
+                            if (dev.monotonic_timestamp && ev.input_event_sec > 0) {
+                                ts_ns = static_cast<uint64_t>(ev.input_event_sec) * 1000000000ULL +
+                                                 static_cast<uint64_t>(ev.input_event_usec) * 1000ULL;
+                            }
                             if (ts_ns == 0) {
                                 auto now = std::chrono::steady_clock::now();
                                 ts_ns = static_cast<uint64_t>(

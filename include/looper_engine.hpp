@@ -3,6 +3,7 @@
 #include "types.hpp"
 #include "command_queue.hpp"
 #include <vector>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <memory>
@@ -100,8 +101,9 @@ private:
     size_t fade_out_remaining_frames_{0};
 
     // Deferred future command storage for commands with timestamps in future blocks
-    bool has_deferred_cmd_{false};
-    ControlCommand deferred_cmd_{};
+    static constexpr size_t MAX_DEFERRED_CMDS = 16;
+    std::array<ControlCommand, MAX_DEFERRED_CMDS> deferred_cmds_{};
+    size_t deferred_count_{0};
 };
 
 } // namespace looper

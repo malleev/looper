@@ -1528,7 +1528,7 @@ void test_timestamp_to_sample_offset_and_deferral() {
     engine.process(in.data(), out_l.data(), out_r.data(), 128, b1_start + B_DUR, B_DUR);
     assert(engine.getStatus().state == LooperState::IDLE);
 
-    // 3. Future Command Deferral Test:
+    // 3. Future Command Deferral Test (Multiple future commands: ACTION @ sample 20, STOP @ sample 80):
     // Start Recording in Block A
     uint64_t ba_start = 2000000000ULL;
     cmd.type = ControlCommandType::ACTION;
@@ -1540,35 +1540,55 @@ void test_timestamp_to_sample_offset_and_deferral() {
     assert(engine.getStatus().state == LooperState::RECORDING);
     assert(engine.getStatus().total_frames == 128);
 
-    // In Block B, queue an ACTION command whose timestamp is in the FUTURE (Block C)
-    // Block B spans [bb_start, bb_start + B_DUR).
-    // Let timestamp be bc_start + 500,000 ns (500 us into Block C).
-    // At 48 kHz, 500 us = 24 samples.
+    // In Block B, queue TWO future commands destined for Block C:
+    // 1) ACTION @ Block C + 20 samples (ends REC -> PLAYING at sample 20)
+    //    At 48 kHz, 20 samples = (20 * 1e9) / 48000 = 416666 ns.
+    // 2) STOP @ Block C + 80 samples (stops playback at sample 80)
+    //    At 48 kHz, 80 samples = (80 * 1e9) / 48000 = 1666666 ns.
     uint64_t bb_start = ba_start + B_DUR;
     uint64_t bc_start = bb_start + B_DUR;
-    uint64_t future_ts = bc_start + 500000ULL;
+    uint64_t ts_action = bc_start + (20ULL * 1000000000ULL) / 48000ULL;
+    uint64_t ts_stop = bc_start + (80ULL * 1000000000ULL) / 48000ULL;
 
-    cmd.type = ControlCommandType::ACTION;
-    cmd.timestamp_ns = future_ts;
-    cmd.sample_offset = 0;
-    ctrl_queue.push(cmd);
+    ControlCommand cmd_action;
+    cmd_action.type = ControlCommandType::ACTION;
+    cmd_action.timestamp_ns = ts_action;
+    cmd_action.sample_offset = 0;
+    ctrl_queue.push(cmd_action);
 
-    // Process Block B: future command must NOT execute here
+    ControlCommand cmd_stop;
+    cmd_stop.type = ControlCommandType::STOP;
+    cmd_stop.timestamp_ns = ts_stop;
+    cmd_stop.sample_offset = 0;
+    ctrl_queue.push(cmd_stop);
+
+    // Process Block B: BOTH future commands must be deferred without dropping any!
+    // Engine must stay in RECORDING through all 128 samples of Block B.
     engine.process(in.data(), out_l.data(), out_r.data(), 128, bb_start, B_DUR);
     assert(engine.getStatus().state == LooperState::RECORDING);
     assert(engine.getStatus().total_frames == 256); // 128 + 128
 
-    // Process Block C: deferred command is executed at sample offset 24
-    std::fill(in.begin(), in.end(), 0.0f);
+    // Process Block C: BOTH deferred commands must execute at their respective offsets (20 and 80)!
+    std::fill(in.begin(), in.end(), 0.0f); // Live dry input becomes 0
     engine.process(in.data(), out_l.data(), out_r.data(), 128, bc_start, B_DUR);
-    assert(engine.getStatus().state == LooperState::PLAYING);
-    assert(engine.getStatus().total_frames == 280); // 256 + 24
 
-    for (size_t i = 0; i < 24; ++i) {
+    // Loop recording ended at sample 20: total_frames must be 256 + 20 = 276 samples!
+    assert(engine.getStatus().total_frames == 276);
+    // At sample 80, STOP executed: final state must be STOPPED!
+    assert(engine.getStatus().state == LooperState::STOPPED);
+
+    // Verify audio sub-slices in Block C:
+    // 0..19: Live input (0.0f) while recording
+    for (size_t i = 0; i < 20; ++i) {
         assert(std::abs(out_l[i]) < 1e-4f);
     }
-    for (size_t i = 24; i < 128; ++i) {
+    // 20..79: Loop playback (0.7f) while PLAYING
+    for (size_t i = 20; i < 80; ++i) {
         assert(std::abs(out_l[i] - 0.7f) < 1e-4f);
+    }
+    // 80..127: Muted (0.0f) after STOP
+    for (size_t i = 80; i < 128; ++i) {
+        assert(std::abs(out_l[i]) < 1e-4f);
     }
 
     std::cout << "PASSED!" << std::endl;

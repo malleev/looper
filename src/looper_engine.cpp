@@ -107,16 +107,16 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     }
 
     // 4. Collect and map pending control commands to sample offsets (Sample-Accurate Footswitch)
-    ControlCommand pending_cmds[8];
+    ControlCommand pending_cmds[32];
     size_t num_cmds = 0;
 
-    // Check if a command was deferred from the previous block
-    if (has_deferred_cmd_) {
-        pending_cmds[num_cmds++] = deferred_cmd_;
-        has_deferred_cmd_ = false;
+    // Load commands deferred from previous blocks
+    for (size_t i = 0; i < deferred_count_; ++i) {
+        pending_cmds[num_cmds++] = deferred_cmds_[i];
     }
+    deferred_count_ = 0;
 
-    while (num_cmds < 8 && ctrl_queue_.pop(pending_cmds[num_cmds])) {
+    while (num_cmds < 32 && ctrl_queue_.pop(pending_cmds[num_cmds])) {
         num_cmds++;
     }
 
@@ -129,15 +129,14 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
             if (cmd.timestamp_ns <= block_start_ns) {
                 cmd.sample_offset = 0;
             } else if (block_end_ns > 0 && cmd.timestamp_ns >= block_end_ns) {
-                // Future command: belongs to next audio block! Defer it!
-                if (!has_deferred_cmd_) {
-                    deferred_cmd_ = cmd;
-                    has_deferred_cmd_ = true;
+                // Future command: belongs to a future audio block! Defer it!
+                if (deferred_count_ < MAX_DEFERRED_CMDS) {
+                    deferred_cmds_[deferred_count_++] = cmd;
                 }
                 continue; // Do not execute in this block
             } else {
                 uint64_t diff_ns = cmd.timestamp_ns - block_start_ns;
-                uint64_t offset = (diff_ns * config_.sample_rate) / 1000000000ULL;
+                uint64_t offset = (diff_ns * config_.sample_rate + 500000000ULL) / 1000000000ULL;
                 if (offset >= nframes) offset = nframes - 1;
                 cmd.sample_offset = static_cast<uint32_t>(offset);
             }
