@@ -44,6 +44,11 @@ private:
 
     AudioTelemetry telemetry_;
 
+    std::vector<int32_t> in_buffer_;
+    std::vector<int32_t> out_buffer_;
+    std::vector<float> mono_in_;
+    std::vector<float> stereo_out_left_;
+    std::vector<float> stereo_out_right_;
     std::vector<int32_t> silence_buffer_;
 
     std::thread audio_thread_;

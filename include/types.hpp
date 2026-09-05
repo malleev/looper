@@ -100,6 +100,8 @@ struct PcmParams {
 struct AudioTelemetry {
     std::atomic<uint64_t> capture_xruns{0};
     std::atomic<uint64_t> playback_xruns{0};
+    std::atomic<uint64_t> suspends{0};
+    std::atomic<uint64_t> disconnects{0};
     std::atomic<uint64_t> short_writes{0};
     std::atomic<uint64_t> recoveries{0};
     std::atomic<uint64_t> fatal_audio_errors{0};
@@ -111,6 +113,8 @@ struct AudioTelemetry {
 struct AudioTelemetrySnapshot {
     uint64_t capture_xruns = 0;
     uint64_t playback_xruns = 0;
+    uint64_t suspends = 0;
+    uint64_t disconnects = 0;
     uint64_t short_writes = 0;
     uint64_t recoveries = 0;
     uint64_t fatal_audio_errors = 0;

@@ -28,6 +28,8 @@ AudioTelemetrySnapshot AudioDevice::getTelemetrySnapshot() const {
     AudioTelemetrySnapshot snap;
     snap.capture_xruns = telemetry_.capture_xruns.load(std::memory_order_relaxed);
     snap.playback_xruns = telemetry_.playback_xruns.load(std::memory_order_relaxed);
+    snap.suspends = telemetry_.suspends.load(std::memory_order_relaxed);
+    snap.disconnects = telemetry_.disconnects.load(std::memory_order_relaxed);
     snap.short_writes = telemetry_.short_writes.load(std::memory_order_relaxed);
     snap.recoveries = telemetry_.recoveries.load(std::memory_order_relaxed);
     snap.fatal_audio_errors = telemetry_.fatal_audio_errors.load(std::memory_order_relaxed);
@@ -48,26 +50,69 @@ bool AudioDevice::initAlsaDevice(snd_pcm_t** handle, const std::string& dev_name
 
     snd_pcm_hw_params_t* hw_params;
     snd_pcm_hw_params_alloca(&hw_params);
-    snd_pcm_hw_params_any(*handle, hw_params);
+    err = snd_pcm_hw_params_any(*handle, hw_params);
+    if (err < 0) {
+        std::cerr << "[ALSA] Cannot initialize hw params on " << dev_name << ": " << snd_strerror(err) << std::endl;
+        snd_pcm_close(*handle);
+        *handle = nullptr;
+        return false;
+    }
 
-    snd_pcm_hw_params_set_access(*handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(*handle, hw_params, SND_PCM_FORMAT_S32_LE);
+    err = snd_pcm_hw_params_set_access(*handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    if (err < 0) {
+        std::cerr << "[ALSA] Cannot set interleaved access on " << dev_name << ": " << snd_strerror(err) << std::endl;
+        snd_pcm_close(*handle);
+        *handle = nullptr;
+        return false;
+    }
+
+    err = snd_pcm_hw_params_set_format(*handle, hw_params, SND_PCM_FORMAT_S32_LE);
+    if (err < 0) {
+        std::cerr << "[ALSA] Cannot set format S32_LE on " << dev_name << ": " << snd_strerror(err) << std::endl;
+        snd_pcm_close(*handle);
+        *handle = nullptr;
+        return false;
+    }
 
     unsigned int ch = (stream == SND_PCM_STREAM_CAPTURE) ? audio_config_.capture_channels : audio_config_.playback_channels;
-    snd_pcm_hw_params_set_channels(*handle, hw_params, ch);
+    err = snd_pcm_hw_params_set_channels(*handle, hw_params, ch);
+    if (err < 0) {
+        std::cerr << "[ALSA] Cannot set channels (" << ch << ") on " << dev_name << ": " << snd_strerror(err) << std::endl;
+        snd_pcm_close(*handle);
+        *handle = nullptr;
+        return false;
+    }
 
     unsigned int rate = audio_config_.sample_rate;
-    snd_pcm_hw_params_set_rate_near(*handle, hw_params, &rate, 0);
+    err = snd_pcm_hw_params_set_rate_near(*handle, hw_params, &rate, 0);
+    if (err < 0) {
+        std::cerr << "[ALSA] Cannot set rate (" << rate << ") on " << dev_name << ": " << snd_strerror(err) << std::endl;
+        snd_pcm_close(*handle);
+        *handle = nullptr;
+        return false;
+    }
 
     snd_pcm_uframes_t period_size = audio_config_.period_size;
-    snd_pcm_hw_params_set_period_size_near(*handle, hw_params, &period_size, 0);
+    err = snd_pcm_hw_params_set_period_size_near(*handle, hw_params, &period_size, 0);
+    if (err < 0) {
+        std::cerr << "[ALSA] Cannot set period size (" << period_size << ") on " << dev_name << ": " << snd_strerror(err) << std::endl;
+        snd_pcm_close(*handle);
+        *handle = nullptr;
+        return false;
+    }
 
     unsigned int periods = audio_config_.periods;
-    snd_pcm_hw_params_set_periods_near(*handle, hw_params, &periods, 0);
+    err = snd_pcm_hw_params_set_periods_near(*handle, hw_params, &periods, 0);
+    if (err < 0) {
+        std::cerr << "[ALSA] Cannot set periods (" << periods << ") on " << dev_name << ": " << snd_strerror(err) << std::endl;
+        snd_pcm_close(*handle);
+        *handle = nullptr;
+        return false;
+    }
 
     err = snd_pcm_hw_params(*handle, hw_params);
     if (err < 0) {
-        std::cerr << "[ALSA] Cannot set hw parameters on " << dev_name << ": " << snd_strerror(err) << std::endl;
+        std::cerr << "[ALSA] Cannot commit hw parameters on " << dev_name << ": " << snd_strerror(err) << std::endl;
         snd_pcm_close(*handle);
         *handle = nullptr;
         return false;
@@ -111,7 +156,14 @@ bool AudioDevice::initAlsaDevice(snd_pcm_t** handle, const std::string& dev_name
         return false;
     }
 
-    snd_pcm_prepare(*handle);
+    err = snd_pcm_prepare(*handle);
+    if (err < 0) {
+        std::cerr << "[ALSA] Cannot prepare device " << dev_name << ": " << snd_strerror(err) << std::endl;
+        snd_pcm_close(*handle);
+        *handle = nullptr;
+        return false;
+    }
+
     return true;
 }
 
@@ -181,7 +233,50 @@ bool AudioDevice::start() {
         return false;
     }
 
-    // Pre-allocate silence cushion buffer (zero allocations inside real-time audio thread)
+    // Hardware and Duplex consistency validation
+    if (audio_config_.capture_channel_index >= capture_params_.channels) {
+        std::cerr << "[ALSA] ERROR: capture_channel_index (" << audio_config_.capture_channel_index 
+                  << ") exceeds available channels (" << capture_params_.channels << ")!" << std::endl;
+        stop();
+        return false;
+    }
+    if (capture_params_.channels != audio_config_.capture_channels) {
+        std::cerr << "[ALSA] ERROR: capture channels (" << capture_params_.channels 
+                  << ") != requested (" << audio_config_.capture_channels << ")!" << std::endl;
+        stop();
+        return false;
+    }
+    if (playback_params_.channels != audio_config_.playback_channels) {
+        std::cerr << "[ALSA] ERROR: playback channels (" << playback_params_.channels 
+                  << ") != requested (" << audio_config_.playback_channels << ")!" << std::endl;
+        stop();
+        return false;
+    }
+    if (capture_params_.sample_rate != playback_params_.sample_rate) {
+        std::cerr << "[ALSA] ERROR: Duplex sample rate mismatch: capture=" << capture_params_.sample_rate 
+                  << " != playback=" << playback_params_.sample_rate << std::endl;
+        stop();
+        return false;
+    }
+    if (capture_params_.period_size != playback_params_.period_size) {
+        std::cerr << "[ALSA] ERROR: Duplex period size mismatch: capture=" << capture_params_.period_size 
+                  << " != playback=" << playback_params_.period_size << std::endl;
+        stop();
+        return false;
+    }
+    if (playback_params_.buffer_size < 2 * playback_params_.period_size) {
+        std::cerr << "[ALSA] ERROR: Playback buffer size (" << playback_params_.buffer_size 
+                  << ") is too small for 2 periods (" << 2 * playback_params_.period_size << ") cushion!" << std::endl;
+        stop();
+        return false;
+    }
+
+    // Pre-allocate & prefault all member audio buffers before starting real-time thread (ZERO allocations in RT loop)
+    in_buffer_.assign(capture_params_.period_size * capture_params_.channels, 0);
+    out_buffer_.assign(playback_params_.period_size * playback_params_.channels, 0);
+    mono_in_.assign(capture_params_.period_size, 0.0f);
+    stereo_out_left_.assign(playback_params_.period_size, 0.0f);
+    stereo_out_right_.assign(playback_params_.period_size, 0.0f);
     silence_buffer_.assign(playback_params_.period_size * playback_params_.channels, 0);
 
     is_running_.store(true);
@@ -220,16 +315,23 @@ snd_pcm_sframes_t AudioDevice::writeAll(const int32_t* data, snd_pcm_uframes_t t
     snd_pcm_uframes_t frames_left = total_frames;
     const int32_t* ptr = data;
     const size_t channels = playback_params_.channels;
+    int zero_write_retries = 0;
 
     while (frames_left > 0 && is_running_.load(std::memory_order_relaxed)) {
         snd_pcm_sframes_t written = snd_pcm_writei(playback_handle_, ptr, frames_left);
         if (written > 0) {
+            zero_write_retries = 0;
             if (static_cast<snd_pcm_uframes_t>(written) < frames_left) {
                 telemetry_.short_writes.fetch_add(1, std::memory_order_relaxed);
             }
             frames_left -= written;
             ptr += written * channels;
-        } else if (written < 0) {
+        } else if (written == 0) {
+            // Guard against driver busy-spin: abort if repeated 0 returns
+            if (++zero_write_retries > 10) {
+                return -EIO;
+            }
+        } else {
             return written; // Return error code to caller for duplex recovery
         }
     }
@@ -237,10 +339,16 @@ snd_pcm_sframes_t AudioDevice::writeAll(const int32_t* data, snd_pcm_uframes_t t
 }
 
 bool AudioDevice::recoverDuplex(int err, snd_pcm_stream_t stream) {
-    if (stream == SND_PCM_STREAM_CAPTURE) {
-        telemetry_.capture_xruns.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        telemetry_.playback_xruns.fetch_add(1, std::memory_order_relaxed);
+    if (err == -EPIPE) {
+        if (stream == SND_PCM_STREAM_CAPTURE) {
+            telemetry_.capture_xruns.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            telemetry_.playback_xruns.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (err == -ESTRPIPE) {
+        telemetry_.suspends.fetch_add(1, std::memory_order_relaxed);
+    } else if (err == -ENODEV) {
+        telemetry_.disconnects.fetch_add(1, std::memory_order_relaxed);
     }
     telemetry_.recoveries.fetch_add(1, std::memory_order_relaxed);
 
@@ -258,17 +366,17 @@ bool AudioDevice::recoverDuplex(int err, snd_pcm_stream_t stream) {
         return false;
     }
 
-    // Re-align duplex pair
-    snd_pcm_drop(capture_handle_);
-    snd_pcm_drop(playback_handle_);
-    snd_pcm_prepare(capture_handle_);
-    snd_pcm_prepare(playback_handle_);
+    // Re-align duplex pair with checked return codes
+    if (snd_pcm_drop(capture_handle_) < 0) return false;
+    if (snd_pcm_drop(playback_handle_) < 0) return false;
+    if (snd_pcm_prepare(capture_handle_) < 0) return false;
+    if (snd_pcm_prepare(playback_handle_) < 0) return false;
 
     // Re-prime playback with 2 periods of silence cushion
-    writeAll(silence_buffer_.data(), playback_params_.period_size);
-    writeAll(silence_buffer_.data(), playback_params_.period_size);
+    if (writeAll(silence_buffer_.data(), playback_params_.period_size) < 0) return false;
+    if (writeAll(silence_buffer_.data(), playback_params_.period_size) < 0) return false;
 
-    snd_pcm_start(capture_handle_);
+    if (snd_pcm_start(capture_handle_) < 0) return false;
     return true;
 }
 
@@ -285,24 +393,20 @@ void AudioDevice::audioLoop() {
     const size_t play_channels = playback_params_.channels;
     const size_t cap_idx = audio_config_.capture_channel_index;
 
-    std::vector<int32_t> in_buffer(period * cap_channels, 0);
-    std::vector<int32_t> out_buffer(period * play_channels, 0);
-
-    std::vector<float> mono_in(period, 0.0f);
-    std::vector<float> stereo_out_left(period, 0.0f);
-    std::vector<float> stereo_out_right(period, 0.0f);
-
     constexpr float INT32_TO_FLOAT = 1.0f / 2147483648.0f;
     constexpr float FLOAT_TO_INT32 = 2147483647.0f;
 
     // Prime playback buffer with 2 periods of silence cushion
-    writeAll(silence_buffer_.data(), period);
-    writeAll(silence_buffer_.data(), period);
-    snd_pcm_start(capture_handle_);
+    if (writeAll(silence_buffer_.data(), period) < 0 || writeAll(silence_buffer_.data(), period) < 0) {
+        return;
+    }
+    if (snd_pcm_start(capture_handle_) < 0) {
+        return;
+    }
 
     while (is_running_.load(std::memory_order_relaxed)) {
-        // Read from ALSA capture (blocking for 1 period)
-        snd_pcm_sframes_t frames_read = snd_pcm_readi(capture_handle_, in_buffer.data(), period);
+        // Read from ALSA capture into pre-allocated member buffer (blocking for 1 period)
+        snd_pcm_sframes_t frames_read = snd_pcm_readi(capture_handle_, in_buffer_.data(), period);
         if (frames_read < 0) {
             if (!recoverDuplex(static_cast<int>(frames_read), SND_PCM_STREAM_CAPTURE)) {
                 break;
@@ -312,12 +416,12 @@ void AudioDevice::audioLoop() {
 
         // De-interleave and convert input Channel to float [-1.0, 1.0]
         for (size_t i = 0; i < static_cast<size_t>(frames_read); ++i) {
-            mono_in[i] = static_cast<float>(in_buffer[i * cap_channels + cap_idx]) * INT32_TO_FLOAT;
+            mono_in_[i] = static_cast<float>(in_buffer_[i * cap_channels + cap_idx]) * INT32_TO_FLOAT;
         }
 
         // Process audio in LooperEngine with execution timing
         auto t_start = std::chrono::steady_clock::now();
-        engine_.process(mono_in.data(), stereo_out_left.data(), stereo_out_right.data(), frames_read);
+        engine_.process(mono_in_.data(), stereo_out_left_.data(), stereo_out_right_.data(), frames_read);
         auto t_end = std::chrono::steady_clock::now();
 
         uint32_t elapsed_us = static_cast<uint32_t>(
@@ -336,19 +440,19 @@ void AudioDevice::audioLoop() {
         // Convert and interleave stereo outputs into playback hardware buffer
         // Ch0 = Left, Ch1 = Right, remaining = 0
         for (size_t i = 0; i < static_cast<size_t>(frames_read); ++i) {
-            float l = std::clamp(stereo_out_left[i], -1.0f, 1.0f);
-            float r = std::clamp(stereo_out_right[i], -1.0f, 1.0f);
-            out_buffer[i * play_channels + 0] = static_cast<int32_t>(l * FLOAT_TO_INT32);
+            float l = std::clamp(stereo_out_left_[i], -1.0f, 1.0f);
+            float r = std::clamp(stereo_out_right_[i], -1.0f, 1.0f);
+            out_buffer_[i * play_channels + 0] = static_cast<int32_t>(l * FLOAT_TO_INT32);
             if (play_channels > 1) {
-                out_buffer[i * play_channels + 1] = static_cast<int32_t>(r * FLOAT_TO_INT32);
+                out_buffer_[i * play_channels + 1] = static_cast<int32_t>(r * FLOAT_TO_INT32);
             }
             for (size_t ch = 2; ch < play_channels; ++ch) {
-                out_buffer[i * play_channels + ch] = 0;
+                out_buffer_[i * play_channels + ch] = 0;
             }
         }
 
         // Write all frames to ALSA playback (handles short writes internally)
-        snd_pcm_sframes_t written = writeAll(out_buffer.data(), frames_read);
+        snd_pcm_sframes_t written = writeAll(out_buffer_.data(), frames_read);
         if (written < 0) {
             if (!recoverDuplex(static_cast<int>(written), SND_PCM_STREAM_PLAYBACK)) {
                 break;

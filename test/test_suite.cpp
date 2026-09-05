@@ -1182,6 +1182,8 @@ void test_prefaulted_buffers_and_telemetry() {
     AudioTelemetry tele;
     assert(tele.capture_xruns.is_lock_free());
     assert(tele.playback_xruns.is_lock_free());
+    assert(tele.suspends.is_lock_free());
+    assert(tele.disconnects.is_lock_free());
     assert(tele.short_writes.is_lock_free());
     assert(tele.recoveries.is_lock_free());
     assert(tele.fatal_audio_errors.is_lock_free());
@@ -1240,6 +1242,57 @@ void test_prefaulted_buffers_and_telemetry() {
     std::cout << "PASSED!" << std::endl;
 }
 
+void test_clear_o1_timing_on_large_loop() {
+    std::cout << "[TEST] CLEAR O(1) Execution Timing on Large Loop (500k samples)... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+    config.pre_roll = 0;
+    config.crossfade_samples = 0;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> in(128, 0.5f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // Record ~500k samples (~3906 blocks)
+    ControlCommand cmd;
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    for (int i = 0; i < 3906; ++i) {
+        engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    }
+    cmd.type = ControlCommandType::ACTION;
+    ctrl_queue.push(cmd);
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    assert(engine.getStatus().state == LooperState::PLAYING);
+    assert(engine.getStatus().total_frames >= 499968);
+
+    // Timing CLEAR on 500k loop
+    cmd.type = ControlCommandType::CLEAR;
+    ctrl_queue.push(cmd);
+    auto t0 = std::chrono::steady_clock::now();
+    engine.process(in.data(), out_l.data(), out_r.data(), 128);
+    auto t1 = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+    assert(engine.getStatus().state == LooperState::IDLE);
+    assert(engine.getStatus().total_frames == 0);
+
+    // Must be strictly O(1) < 1500 us (even with ASan overhead)
+    assert(elapsed_us < 1500);
+
+    std::cout << "PASSED! (Elapsed: " << elapsed_us << " us)" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  RUNNING LOOPER ENGINE UNIT TESTS      " << std::endl;
@@ -1263,8 +1316,9 @@ int main() {
     test_fade_during_overdub_preserves_take();
     test_action_aborts_active_save();
     test_prefaulted_buffers_and_telemetry();
+    test_clear_o1_timing_on_large_loop();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (18/18)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (19/19)" << std::endl;
     return 0;
 }
 

@@ -378,11 +378,6 @@ void LooperEngine::processPendingCommands() {
                 }
 
                 state_.store(LooperState::IDLE, std::memory_order_release);
-                if (loop_length_ > 0) {
-                    if (base_track_ptr_) std::fill_n(base_track_ptr_->begin(), loop_length_, 0.0f);
-                    if (last_layer_ptr_) std::fill_n(last_layer_ptr_->begin(), loop_length_, 0.0f);
-                    if (record_layer_ptr_) std::fill_n(record_layer_ptr_->begin(), loop_length_, 0.0f);
-                }
                 loop_length_ = 0;
                 playhead_ = 0;
                 has_undo_layer_ = false;
@@ -499,7 +494,7 @@ void LooperEngine::processPendingCommands() {
                 if (!overflow_return_buf3_) overflow_return_buf3_ = old_record;
             }
 
-            loop_length_ = (load_cmd.loop_length > 0) ? load_cmd.loop_length : base_track_ptr_->size();
+            loop_length_ = std::min((load_cmd.loop_length > 0) ? load_cmd.loop_length : base_track_ptr_->size(), MAX_LOOP_FRAMES);
             playhead_ = 0;
             has_undo_layer_ = false;
             is_undone_ = false;
