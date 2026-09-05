@@ -135,14 +135,20 @@ void WavWorker::workerLoop() {
                     if (loaded.size() > MAX_LOOP_FRAMES) {
                         if (callback_) callback_("Load error: WAV file exceeds 10 min max", true);
                     } else {
-                        auto* new_buf = new std::vector<float>();
-                        new_buf->reserve(MAX_LOOP_FRAMES);
-                        new_buf->assign(loaded.begin(), loaded.end());
+                        auto* new_base = new std::vector<float>();
+                        new_base->reserve(MAX_LOOP_FRAMES);
+                        new_base->assign(loaded.begin(), loaded.end());
+
+                        auto* new_layer = new std::vector<float>();
+                        new_layer->reserve(MAX_LOOP_FRAMES);
+                        new_layer->assign(loaded.size(), 0.0f); // Pre-zeroed on background worker thread!
 
                         LoadCommand cmd;
-                        cmd.buffer = new_buf;
+                        cmd.base_buffer = new_base;
+                        cmd.layer_buffer = new_layer;
                         if (!load_queue_.push(cmd)) {
-                            delete new_buf; // Clean up on push failure
+                            delete new_base; // Clean up on push failure
+                            delete new_layer;
                             if (callback_) callback_("Load error: engine load queue full", true);
                         } else {
                             if (callback_) callback_("Loaded: " + task.filepath, false);

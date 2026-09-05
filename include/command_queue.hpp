@@ -29,7 +29,8 @@ struct ControlCommand {
 };
 
 struct LoadCommand {
-    std::vector<float>* buffer = nullptr;
+    std::vector<float>* base_buffer = nullptr;
+    std::vector<float>* layer_buffer = nullptr;
 };
 
 struct SaveSlotCommand {

@@ -46,6 +46,7 @@ private:
     std::atomic<float> in_peak_{0.0f};
     std::atomic<uint32_t> latency_compensation_{DEFAULT_DIRECT_LATENCY};
     std::atomic<MonitorMode> monitor_mode_{MonitorMode::SOFTWARE};
+    std::atomic<float> status_loop_gain_{1.0f};
 
     // Atomic status mirrors for UI to avoid data races
     std::atomic<size_t> status_playhead_{0};
@@ -53,24 +54,30 @@ private:
 
     // Pre-allocated loop buffers (owned and accessed exclusively by real-time audio thread)
     std::vector<float>* base_track_ptr_{nullptr};
-    std::vector<float> last_layer_;
+    std::vector<float>* last_layer_ptr_{nullptr};
     bool has_undo_layer_{false};
     bool is_undone_{false};
 
-    // Incremental overdub tracking (eliminates O(N) operations)
+    // Incremental overdub tracking in transport domain
     size_t overdub_frames_recorded_{0};
+    size_t last_overdub_comp_playhead_{0};
+    bool merge_old_layer_to_base_{false};
+
+    // Background chunked merge in transport domain
     bool pending_merge_active_{false};
-    size_t pending_merge_idx_{0};
+    size_t pending_merge_playhead_{0};
     size_t pending_merge_frames_{0};
+    bool pending_merge_is_reversed_{false};
 
     // Chunked non-blocking WAV save snapshot state
-    static constexpr size_t SAVE_CHUNK_SIZE = 4096;
+    static constexpr size_t SAVE_CHUNK_SIZE = 16384;
     std::vector<float>* active_save_buf_{nullptr};
     size_t save_copy_progress_{0};
     size_t save_copy_total_{0};
 
-    // Overflow return buffer fallback in case return queue is momentarily full
+    // Overflow return buffer fallbacks in case return queue is momentarily full
     std::vector<float>* overflow_return_buf_{nullptr};
+    std::vector<float>* overflow_return_buf2_{nullptr};
 
     // Rolling circular pre-roll buffer
     std::vector<float> pre_roll_buffer_;
