@@ -4,6 +4,7 @@
 #include "audio_device.hpp"
 #include "input_manager.hpp"
 #include "gpio_manager.hpp"
+#include "display_manager.hpp"
 #include "wav_worker.hpp"
 #include "latency_calibrator.hpp"
 
@@ -555,11 +556,13 @@ int main(int argc, char* argv[]) {
 
     looper::InputManager input_manager(handleActionKey);
     looper::GpioManager gpio_manager(handleActionKey);
+    looper::DisplayManager display_manager;
 
     input_manager.start();
     if (!gpio_manager.start()) {
         setInfoMessage("Warning: GPIO buttons/LEDs unavailable (check permissions)", 4);
     }
+    display_manager.start();
     std::cout << "[SYSTEM] Input managers ready. Waiting for triggers...\n" << std::endl;
 
     bool fatal_error = false;
@@ -578,12 +581,23 @@ int main(int argc, char* argv[]) {
         auto status = engine.getStatus();
         printStatus(status, current_loop_gain.load(std::memory_order_relaxed), audio_device.getTelemetrySnapshot());
         gpio_manager.updateStatus(status);
+
+        std::string active_info = "";
+        {
+            std::lock_guard<std::mutex> lock(g_info_mutex);
+            if (!g_info_message.empty() && std::chrono::steady_clock::now() < g_info_expire) {
+                active_info = g_info_message;
+            }
+        }
+        display_manager.updateStatus(status, current_loop_gain.load(std::memory_order_relaxed), active_info);
+
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     std::cout << "\n\n[SYSTEM] Stopping audio engine..." << std::endl;
     input_manager.stop();
     gpio_manager.stop();
+    display_manager.stop();
     audio_device.stop();
     wav_worker.stop();
     std::cout << "[SYSTEM] Clean shutdown complete. Goodbye!" << std::endl;

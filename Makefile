@@ -10,7 +10,7 @@ endif
 TARGET = looper
 TEST_TARGET = looper_tests
 
-SRCS = src/main.cpp src/audio_device.cpp src/looper_engine.cpp src/input_manager.cpp src/gpio_manager.cpp src/wav_file.cpp src/wav_worker.cpp src/latency_calibrator.cpp
+SRCS = src/main.cpp src/audio_device.cpp src/looper_engine.cpp src/input_manager.cpp src/gpio_manager.cpp src/display_manager.cpp src/wav_file.cpp src/wav_worker.cpp src/latency_calibrator.cpp
 OBJS = $(SRCS:.cpp=.o)
 
 TEST_SRCS = test/test_suite.cpp src/looper_engine.cpp src/wav_file.cpp src/wav_worker.cpp src/latency_calibrator.cpp

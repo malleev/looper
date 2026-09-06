@@ -40,6 +40,7 @@ set(COMMON_SOURCES
     src/looper_engine.cpp
     src/input_manager.cpp
     src/gpio_manager.cpp
+    src/display_manager.cpp
     src/wav_file.cpp
     src/wav_worker.cpp
     src/latency_calibrator.cpp
