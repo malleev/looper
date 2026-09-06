@@ -70,6 +70,7 @@ struct LooperStatus {
     float total_sec = 0.0f;
     float in_peak = 0.0f;
     bool in_clipped = false;
+    bool in_severe_clipped = false;
     uint32_t configured_latency_samples = DEFAULT_DIRECT_LATENCY;
     uint32_t effective_latency_samples = DEFAULT_DIRECT_LATENCY;
     float effective_latency_ms = 8.0f;

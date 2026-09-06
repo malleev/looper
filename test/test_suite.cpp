@@ -1621,11 +1621,19 @@ void test_peak_hold_and_clip_detection() {
     assert(!status.in_clipped);
     assert(status.in_peak >= 0.19f && status.in_peak <= 0.21f);
 
-    // 2. Feed a clipping block (0.95f) -> clip must trigger immediately
-    engine.process(clip_in.data(), out_l.data(), out_r.data(), 128);
+    // 2. Feed a clipping block (0.90f) -> moderate clip must trigger
+    std::vector<float> mod_clip_in(128, 0.90f);
+    engine.process(mod_clip_in.data(), out_l.data(), out_r.data(), 128);
     status = engine.getStatus();
     assert(status.in_clipped);
-    assert(status.in_peak >= 0.94f);
+    assert(!status.in_severe_clipped);
+
+    // 2b. Feed a severe clipping block (0.98f) -> severe clip must trigger
+    std::vector<float> severe_clip_in(128, 0.98f);
+    engine.process(severe_clip_in.data(), out_l.data(), out_r.data(), 128);
+    status = engine.getStatus();
+    assert(status.in_clipped);
+    assert(status.in_severe_clipped);
 
     // 3. Feed silence for 10 blocks (1280 frames = ~26.6ms) -> clip MUST hold!
     for (int i = 0; i < 10; ++i) {
@@ -1633,6 +1641,7 @@ void test_peak_hold_and_clip_detection() {
     }
     status = engine.getStatus();
     assert(status.in_clipped); // Peak hold active!
+    assert(status.in_severe_clipped);
 
     // 4. Feed silence for > 500ms (> 3.5 time constants at tau=150ms)
     for (int i = 0; i < 200; ++i) {
@@ -1640,6 +1649,7 @@ void test_peak_hold_and_clip_detection() {
     }
     status = engine.getStatus();
     assert(!status.in_clipped); // Clip hold expired!
+    assert(!status.in_severe_clipped);
     assert(status.in_peak < 0.05f); // Peak smoothly decayed to < 5%
 
     std::cout << "PASSED!" << std::endl;

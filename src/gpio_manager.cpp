@@ -34,8 +34,9 @@ constexpr unsigned int LED_RED_OFFSET   = 6; // PA6
 constexpr unsigned int LED_GREEN_OFFSET = 1; // PA1
 constexpr unsigned int LED_BLUE_OFFSET  = 0; // PA0
 
-constexpr unsigned int CLIP_LED_RED_OFFSET   = 13; // PA13 (Pin 8)  - Clip / Overload LED
-constexpr unsigned int CLIP_LED_GREEN_OFFSET = 14; // PA14 (Pin 10) - Signal Present LED
+constexpr unsigned int CLIP_LED_RED_OFFSET   = 14;  // PA14 (Pin 10) - Red
+constexpr unsigned int CLIP_LED_GREEN_OFFSET = 13;  // PA13 (Pin 8)  - Green
+constexpr unsigned int CLIP_LED_BLUE_OFFSET  = 110; // PD14 (Pin 12) - Blue (for White-Red on severe clip)
 
 struct GpioManager::Impl {
     explicit Impl(KeyCallback cb) : callback(std::move(cb)) {}
@@ -55,6 +56,7 @@ struct GpioManager::Impl {
 
     struct gpiod_line* clip_led_r{nullptr};
     struct gpiod_line* clip_led_g{nullptr};
+    struct gpiod_line* clip_led_b{nullptr};
     bool clip_leds_active{false};
 
     int current_r{-1};
@@ -62,7 +64,9 @@ struct GpioManager::Impl {
     int current_b{-1};
     int current_clip_r{-1};
     int current_clip_g{-1};
+    int current_clip_b{-1};
 
+    std::chrono::steady_clock::time_point start_time{std::chrono::steady_clock::now()};
     std::array<uint64_t, 32> last_press_ts_ns{};
 
     bool init() {
@@ -93,14 +97,17 @@ struct GpioManager::Impl {
         // 2. Initialize Clip / Overload & Signal LED lines
         clip_led_r = gpiod_chip_get_line(chip, CLIP_LED_RED_OFFSET);
         clip_led_g = gpiod_chip_get_line(chip, CLIP_LED_GREEN_OFFSET);
+        clip_led_b = gpiod_chip_get_line(chip, CLIP_LED_BLUE_OFFSET);
         if (clip_led_r && clip_led_g) {
             int ret_cr = gpiod_line_request_output(clip_led_r, "looper_clip_r", 0);
             int ret_cg = gpiod_line_request_output(clip_led_g, "looper_sig_g", 0);
+            int ret_cb = clip_led_b ? gpiod_line_request_output(clip_led_b, "looper_clip_b", 0) : -1;
             if (ret_cr == 0 && ret_cg == 0) {
                 clip_leds_active = true;
                 current_clip_r = 0;
                 current_clip_g = 0;
-                std::cout << "[GPIO] Overload/Signal LED initialized on PA13 (Red/Clip) & PA14 (Green/Signal).\n";
+                current_clip_b = (ret_cb == 0) ? 0 : -1;
+                std::cout << "[GPIO] Overload/Signal LED initialized on Pin 10(R), Pin 8(G), Pin 12(B).\n";
             } else {
                 std::cerr << "[GPIO] Warning: Failed to configure Overload/Signal LED output lines.\n";
             }
@@ -164,6 +171,10 @@ struct GpioManager::Impl {
                 gpiod_line_set_value(clip_led_g, 0);
                 gpiod_line_release(clip_led_g);
             }
+            if (clip_led_b) {
+                gpiod_line_set_value(clip_led_b, 0);
+                gpiod_line_release(clip_led_b);
+            }
             clip_leds_active = false;
         }
 
@@ -206,8 +217,10 @@ struct GpioManager::Impl {
         if (clip_leds_active) {
             if (clip_led_r) gpiod_line_set_value(clip_led_r, 0);
             if (clip_led_g) gpiod_line_set_value(clip_led_g, 0);
+            if (clip_led_b) gpiod_line_set_value(clip_led_b, 0);
             current_clip_r = 0;
             current_clip_g = 0;
+            current_clip_b = 0;
         }
     }
 
@@ -251,16 +264,40 @@ struct GpioManager::Impl {
 
         // Update Overload (Clip) and Audio Signal LEDs
         if (clip_leds_active) {
-            int clip_val = status.in_clipped ? 1 : 0;
-            int sig_val = (status.in_peak > 0.02f) ? 1 : 0;
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time
+            ).count();
 
-            if (clip_val != current_clip_r) {
-                gpiod_line_set_value(clip_led_r, clip_val);
-                current_clip_r = clip_val;
+            int r = 0, g = 0, b = 0;
+
+            if (elapsed_ms < 1500) {
+                // POST: Flash White-Red on startup
+                r = 1; g = 1; b = 1;
+            } else if (status.in_severe_clipped) {
+                // Tier 3: Severe Overload -> White-Red (all 3 channels on)
+                r = 1; g = 1; b = 1;
+            } else if (status.in_clipped) {
+                // Tier 2: Overload / Clip -> Red
+                r = 1; g = 0; b = 0;
+            } else if (status.in_peak > 0.005f) {
+                // Tier 1: Any audio sound -> Green
+                r = 0; g = 1; b = 0;
+            } else {
+                // Silence -> Off
+                r = 0; g = 0; b = 0;
             }
-            if (sig_val != current_clip_g) {
-                gpiod_line_set_value(clip_led_g, sig_val);
-                current_clip_g = sig_val;
+
+            if (r != current_clip_r) {
+                gpiod_line_set_value(clip_led_r, r);
+                current_clip_r = r;
+            }
+            if (g != current_clip_g) {
+                gpiod_line_set_value(clip_led_g, g);
+                current_clip_g = g;
+            }
+            if (clip_led_b && b != current_clip_b) {
+                gpiod_line_set_value(clip_led_b, b);
+                current_clip_b = b;
             }
         }
     }

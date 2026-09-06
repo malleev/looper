@@ -192,13 +192,32 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
     float new_peak = std::max(max_peak, prev_peak * decay);
     in_peak_.store(new_peak, std::memory_order_relaxed);
 
-    // Clip detection with peak-hold latch (250 ms hold)
-    // 0.85f corresponds to ~ -1.4 dBFS, matching hardware audio interface clip LEDs
+    // Clip detection with 2-tier peak-hold latch (250 ms hold)
+    // 0.85f corresponds to ~ -1.4 dBFS (moderate clip)
+    // 0.96f corresponds to ~ -0.35 dBFS (severe clip / converter limit)
     constexpr float CLIP_THRESHOLD = 0.85f;
-    if (max_peak >= CLIP_THRESHOLD) {
+    constexpr float SEVERE_CLIP_THRESHOLD = 0.96f;
+
+    if (max_peak >= SEVERE_CLIP_THRESHOLD) {
+        severe_clip_hold_frames_ = static_cast<uint32_t>(config_.sample_rate * 0.25f);
+        clip_hold_frames_ = severe_clip_hold_frames_;
+        in_severe_clipped_.store(true, std::memory_order_relaxed);
+        in_clipped_.store(true, std::memory_order_relaxed);
+    } else if (max_peak >= CLIP_THRESHOLD) {
         clip_hold_frames_ = static_cast<uint32_t>(config_.sample_rate * 0.25f);
         in_clipped_.store(true, std::memory_order_relaxed);
-    } else if (clip_hold_frames_ > 0) {
+    }
+
+    if (severe_clip_hold_frames_ > 0) {
+        if (severe_clip_hold_frames_ > nframes) {
+            severe_clip_hold_frames_ -= static_cast<uint32_t>(nframes);
+        } else {
+            severe_clip_hold_frames_ = 0;
+            in_severe_clipped_.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    if (clip_hold_frames_ > 0) {
         if (clip_hold_frames_ > nframes) {
             clip_hold_frames_ -= static_cast<uint32_t>(nframes);
         } else {
@@ -701,6 +720,7 @@ LooperStatus LooperEngine::getStatus() const {
     s.total_sec = static_cast<float>(s.total_frames) / config_.sample_rate;
     s.in_peak = in_peak_.load(std::memory_order_relaxed);
     s.in_clipped = in_clipped_.load(std::memory_order_relaxed);
+    s.in_severe_clipped = in_severe_clipped_.load(std::memory_order_relaxed);
 
     s.configured_latency_samples = latency_compensation_.load(std::memory_order_relaxed);
     if (s.monitor_mode == MonitorMode::DIRECT_ANALOG) {
