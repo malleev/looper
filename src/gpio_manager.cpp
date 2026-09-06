@@ -262,42 +262,31 @@ struct GpioManager::Impl {
             setLedColor(r, g, b);
         }
 
-        // Update Overload (Clip) and Audio Signal LEDs
+        // Dedicated Overload / Clip indicator (Red on overload, Off otherwise)
         if (clip_leds_active) {
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start_time
             ).count();
 
-            int r = 0, g = 0, b = 0;
-
-            if (elapsed_ms < 1500) {
-                // POST: Flash White-Red on startup
-                r = 1; g = 1; b = 1;
-            } else if (status.in_severe_clipped) {
-                // Tier 3: Severe Overload -> White-Red (all 3 channels on)
-                r = 1; g = 1; b = 1;
-            } else if (status.in_clipped) {
-                // Tier 2: Overload / Clip -> Red
-                r = 1; g = 0; b = 0;
-            } else if (status.in_peak > 0.005f) {
-                // Tier 1: Any audio sound -> Green
-                r = 0; g = 1; b = 0;
+            int r = 0;
+            if (elapsed_ms < 800) {
+                // Short 0.8s test flash on startup
+                r = 1;
             } else {
-                // Silence -> Off
-                r = 0; g = 0; b = 0;
+                r = status.in_clipped ? 1 : 0;
             }
 
             if (r != current_clip_r) {
                 gpiod_line_set_value(clip_led_r, r);
                 current_clip_r = r;
             }
-            if (g != current_clip_g) {
-                gpiod_line_set_value(clip_led_g, g);
-                current_clip_g = g;
+            if (current_clip_g != 0) {
+                gpiod_line_set_value(clip_led_g, 0);
+                current_clip_g = 0;
             }
-            if (clip_led_b && b != current_clip_b) {
-                gpiod_line_set_value(clip_led_b, b);
-                current_clip_b = b;
+            if (clip_led_b && current_clip_b != 0) {
+                gpiod_line_set_value(clip_led_b, 0);
+                current_clip_b = 0;
             }
         }
     }

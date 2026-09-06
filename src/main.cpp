@@ -77,9 +77,7 @@ void printStatus(const looper::LooperStatus& status, float loop_gain, const loop
     else if (status.in_peak >= 0.12f) meter_fill = 2;
     else if (status.in_peak >= 0.02f) meter_fill = 1;
 
-    if (status.in_severe_clipped) {
-        std::cout << "IN:[\033[1;45;37mOVER\033[0m] ";
-    } else if (status.in_clipped) {
+    if (status.in_clipped) {
         std::cout << "IN:[\033[1;41;37mCLIP\033[0m] ";
     } else {
         std::string meter_col = (status.in_peak > 0.70f) ? "\033[1;33m" : "\033[1;32m";
