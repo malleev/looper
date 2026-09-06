@@ -32,3 +32,6 @@ recordings/
 Thumbs.db
 .vscode/
 .idea/
+__pycache__/
+*.pyc
+test_led
