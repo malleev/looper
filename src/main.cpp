@@ -548,7 +548,9 @@ int main(int argc, char* argv[]) {
     looper::GpioManager gpio_manager(handleActionKey);
 
     input_manager.start();
-    gpio_manager.start();
+    if (!gpio_manager.start()) {
+        setInfoMessage("Warning: GPIO buttons/LEDs unavailable (check permissions)", 4);
+    }
     std::cout << "[SYSTEM] Input managers ready. Waiting for triggers...\n" << std::endl;
 
     bool fatal_error = false;
