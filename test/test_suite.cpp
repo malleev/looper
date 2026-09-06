@@ -1594,6 +1594,57 @@ void test_timestamp_to_sample_offset_and_deferral() {
     std::cout << "PASSED!" << std::endl;
 }
 
+void test_peak_hold_and_clip_detection() {
+    std::cout << "[TEST] Peak Hold & Clip Detection Ballistics... " << std::flush;
+
+    ControlQueue ctrl_queue;
+    LoadQueue load_queue;
+    BufferReturnQueue return_queue;
+    SaveSlotQueue save_slot_queue;
+    SaveReadyQueue save_ready_queue;
+
+    LooperConfig config;
+    config.sample_rate = 48000;
+    config.period_size = 128;
+
+    LooperEngine engine(ctrl_queue, load_queue, return_queue, save_slot_queue, save_ready_queue, config);
+
+    std::vector<float> normal_in(128, 0.2f);
+    std::vector<float> clip_in(128, 0.95f);
+    std::vector<float> silence_in(128, 0.0f);
+    std::vector<float> out_l(128, 0.0f);
+    std::vector<float> out_r(128, 0.0f);
+
+    // 1. Process normal signal (0.2f) -> no clip
+    engine.process(normal_in.data(), out_l.data(), out_r.data(), 128);
+    auto status = engine.getStatus();
+    assert(!status.in_clipped);
+    assert(status.in_peak >= 0.19f && status.in_peak <= 0.21f);
+
+    // 2. Feed a clipping block (0.95f) -> clip must trigger immediately
+    engine.process(clip_in.data(), out_l.data(), out_r.data(), 128);
+    status = engine.getStatus();
+    assert(status.in_clipped);
+    assert(status.in_peak >= 0.94f);
+
+    // 3. Feed silence for 10 blocks (1280 frames = ~26.6ms) -> clip MUST hold!
+    for (int i = 0; i < 10; ++i) {
+        engine.process(silence_in.data(), out_l.data(), out_r.data(), 128);
+    }
+    status = engine.getStatus();
+    assert(status.in_clipped); // Peak hold active!
+
+    // 4. Feed silence for > 500ms (> 3.5 time constants at tau=150ms)
+    for (int i = 0; i < 200; ++i) {
+        engine.process(silence_in.data(), out_l.data(), out_r.data(), 128);
+    }
+    status = engine.getStatus();
+    assert(!status.in_clipped); // Clip hold expired!
+    assert(status.in_peak < 0.05f); // Peak smoothly decayed to < 5%
+
+    std::cout << "PASSED!" << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "  RUNNING LOOPER ENGINE UNIT TESTS      " << std::endl;
@@ -1622,8 +1673,9 @@ int main() {
     test_sample_accurate_action_trigger();
     test_latency_calibrator_pulse_detection();
     test_timestamp_to_sample_offset_and_deferral();
+    test_peak_hold_and_clip_detection();
 
-    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (23/23)" << std::endl;
+    std::cout << "\nALL UNIT TESTS PASSED SUCCESSFULLY! (24/24)" << std::endl;
     return 0;
 }
 

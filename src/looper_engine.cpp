@@ -184,7 +184,28 @@ void LooperEngine::process(const float* in, float* out_left, float* out_right, s
         processAudioSlice(in, out_left, out_right, cur_frame, nframes, max_peak);
     }
 
-    in_peak_.store(max_peak, std::memory_order_relaxed);
+    // Peak ballistics: instantaneous attack, smooth exponential decay (~150ms half-life)
+    float prev_peak = in_peak_.load(std::memory_order_relaxed);
+    float decay = (nframes > 0 && config_.sample_rate > 0)
+        ? std::exp(-static_cast<float>(nframes) / (config_.sample_rate * 0.15f))
+        : 0.95f;
+    float new_peak = std::max(max_peak, prev_peak * decay);
+    in_peak_.store(new_peak, std::memory_order_relaxed);
+
+    // Clip detection with peak-hold latch (250 ms hold)
+    // 0.85f corresponds to ~ -1.4 dBFS, matching hardware audio interface clip LEDs
+    constexpr float CLIP_THRESHOLD = 0.85f;
+    if (max_peak >= CLIP_THRESHOLD) {
+        clip_hold_frames_ = static_cast<uint32_t>(config_.sample_rate * 0.25f);
+        in_clipped_.store(true, std::memory_order_relaxed);
+    } else if (clip_hold_frames_ > 0) {
+        if (clip_hold_frames_ > nframes) {
+            clip_hold_frames_ -= static_cast<uint32_t>(nframes);
+        } else {
+            clip_hold_frames_ = 0;
+            in_clipped_.store(false, std::memory_order_relaxed);
+        }
+    }
 
     // Atomically publish status for UI thread (eliminates getStatus data race)
     status_playhead_.store(playhead_, std::memory_order_relaxed);
@@ -679,6 +700,7 @@ LooperStatus LooperEngine::getStatus() const {
     s.current_sec = static_cast<float>(s.playhead_frames) / config_.sample_rate;
     s.total_sec = static_cast<float>(s.total_frames) / config_.sample_rate;
     s.in_peak = in_peak_.load(std::memory_order_relaxed);
+    s.in_clipped = in_clipped_.load(std::memory_order_relaxed);
 
     s.configured_latency_samples = latency_compensation_.load(std::memory_order_relaxed);
     if (s.monitor_mode == MonitorMode::DIRECT_ANALOG) {

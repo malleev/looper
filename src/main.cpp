@@ -71,14 +71,23 @@ void printStatus(const looper::LooperStatus& status, float loop_gain, const loop
 
     // Input Meter (6 chars)
     constexpr int METER_WIDTH = 4;
-    int meter_fill = std::clamp(static_cast<int>(status.in_peak * 10 * METER_WIDTH), 0, METER_WIDTH);
-    std::string meter_col = (status.in_peak > 0.8f) ? "\033[1;31m" : "\033[1;32m";
-    std::cout << "IN:[" << meter_col;
-    for (int i = 0; i < METER_WIDTH; ++i) {
-        if (i < meter_fill) std::cout << "#";
-        else std::cout << "-";
+    int meter_fill = 0;
+    if (status.in_peak >= 0.75f) meter_fill = 4;
+    else if (status.in_peak >= 0.40f) meter_fill = 3;
+    else if (status.in_peak >= 0.12f) meter_fill = 2;
+    else if (status.in_peak >= 0.02f) meter_fill = 1;
+
+    if (status.in_clipped) {
+        std::cout << "IN:[\033[1;41;37mCLIP\033[0m] ";
+    } else {
+        std::string meter_col = (status.in_peak > 0.70f) ? "\033[1;33m" : "\033[1;32m";
+        std::cout << "IN:[" << meter_col;
+        for (int i = 0; i < METER_WIDTH; ++i) {
+            if (i < meter_fill) std::cout << "#";
+            else std::cout << "-";
+        }
+        std::cout << "\033[0m] ";
     }
-    std::cout << "\033[0m] ";
 
     // Progress Bar (10 chars)
     constexpr int BAR_WIDTH = 8;

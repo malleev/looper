@@ -52,6 +52,8 @@ private:
     std::atomic<bool> undo_available_{false};
     std::atomic<bool> redo_available_{false};
     std::atomic<float> in_peak_{0.0f};
+    std::atomic<bool> in_clipped_{false};
+    uint32_t clip_hold_frames_{0};
     std::atomic<uint32_t> latency_compensation_{DEFAULT_DIRECT_LATENCY};
     std::atomic<MonitorMode> monitor_mode_{MonitorMode::SOFTWARE};
     std::atomic<float> status_loop_gain_{1.0f};

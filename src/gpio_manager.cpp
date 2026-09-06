@@ -34,6 +34,9 @@ constexpr unsigned int LED_RED_OFFSET   = 6; // PA6
 constexpr unsigned int LED_GREEN_OFFSET = 1; // PA1
 constexpr unsigned int LED_BLUE_OFFSET  = 0; // PA0
 
+constexpr unsigned int CLIP_LED_RED_OFFSET   = 13; // PA13 (Pin 8)  - Clip / Overload LED
+constexpr unsigned int CLIP_LED_GREEN_OFFSET = 14; // PA14 (Pin 10) - Signal Present LED
+
 struct GpioManager::Impl {
     explicit Impl(KeyCallback cb) : callback(std::move(cb)) {}
 
@@ -50,9 +53,15 @@ struct GpioManager::Impl {
     struct gpiod_line* led_b{nullptr};
     bool leds_active{false};
 
+    struct gpiod_line* clip_led_r{nullptr};
+    struct gpiod_line* clip_led_g{nullptr};
+    bool clip_leds_active{false};
+
     int current_r{-1};
     int current_g{-1};
     int current_b{-1};
+    int current_clip_r{-1};
+    int current_clip_g{-1};
 
     std::array<uint64_t, 32> last_press_ts_ns{};
 
@@ -78,6 +87,22 @@ struct GpioManager::Impl {
                 std::cout << "[GPIO] RGB Status LED initialized on PA6(R), PA1(G), PA0(B).\n";
             } else {
                 std::cerr << "[GPIO] Warning: Failed to configure RGB LED output lines.\n";
+            }
+        }
+
+        // 2. Initialize Clip / Overload & Signal LED lines
+        clip_led_r = gpiod_chip_get_line(chip, CLIP_LED_RED_OFFSET);
+        clip_led_g = gpiod_chip_get_line(chip, CLIP_LED_GREEN_OFFSET);
+        if (clip_led_r && clip_led_g) {
+            int ret_cr = gpiod_line_request_output(clip_led_r, "looper_clip_r", 0);
+            int ret_cg = gpiod_line_request_output(clip_led_g, "looper_sig_g", 0);
+            if (ret_cr == 0 && ret_cg == 0) {
+                clip_leds_active = true;
+                current_clip_r = 0;
+                current_clip_g = 0;
+                std::cout << "[GPIO] Overload/Signal LED initialized on PA13 (Red/Clip) & PA14 (Green/Signal).\n";
+            } else {
+                std::cerr << "[GPIO] Warning: Failed to configure Overload/Signal LED output lines.\n";
             }
         }
 
@@ -130,6 +155,17 @@ struct GpioManager::Impl {
             }
         }
         setLedColor(0, 0, 0);
+        if (clip_leds_active) {
+            if (clip_led_r) {
+                gpiod_line_set_value(clip_led_r, 0);
+                gpiod_line_release(clip_led_r);
+            }
+            if (clip_led_g) {
+                gpiod_line_set_value(clip_led_g, 0);
+                gpiod_line_release(clip_led_g);
+            }
+            clip_leds_active = false;
+        }
 
         if (buttons_active) {
             gpiod_line_release_bulk(&button_lines);
@@ -165,43 +201,68 @@ struct GpioManager::Impl {
         }
     }
 
+    void setOff() {
+        setLedColor(0, 0, 0);
+        if (clip_leds_active) {
+            if (clip_led_r) gpiod_line_set_value(clip_led_r, 0);
+            if (clip_led_g) gpiod_line_set_value(clip_led_g, 0);
+            current_clip_r = 0;
+            current_clip_g = 0;
+        }
+    }
+
     void updateStatus(const LooperStatus& status) {
-        if (!leds_active) return;
+        if (leds_active) {
+            int r = 0, g = 0, b = 0;
 
-        int r = 0, g = 0, b = 0;
+            switch (status.state) {
+                case LooperState::IDLE:
+                    r = 0; g = 0; b = 0;
+                    break;
 
-        switch (status.state) {
-            case LooperState::IDLE:
-                r = 0; g = 0; b = 0;
-                break;
+                case LooperState::RECORDING:
+                    r = 1; g = 0; b = 0; // Solid RED
+                    break;
 
-            case LooperState::RECORDING:
-                r = 1; g = 0; b = 0; // Solid RED
-                break;
+                case LooperState::PLAYING:
+                    if (status.is_fading_out) {
+                        // Blink Green at 4 Hz during fade-out
+                        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()
+                        ).count();
+                        g = ((now_ms / 125) % 2 == 0) ? 1 : 0;
+                    } else {
+                        g = 1; // Solid GREEN
+                    }
+                    r = 0; b = 0;
+                    break;
 
-            case LooperState::PLAYING:
-                if (status.is_fading_out) {
-                    // Blink Green at 4 Hz during fade-out
-                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()
-                    ).count();
-                    g = ((now_ms / 125) % 2 == 0) ? 1 : 0;
-                } else {
-                    g = 1; // Solid GREEN
-                }
-                r = 0; b = 0;
-                break;
+                case LooperState::OVERDUB:
+                    r = 1; g = 1; b = 0; // Solid YELLOW (Red + Green)
+                    break;
 
-            case LooperState::OVERDUB:
-                r = 1; g = 1; b = 0; // Solid YELLOW (Red + Green)
-                break;
+                case LooperState::STOPPED:
+                    r = 0; g = 0; b = 1; // Solid BLUE
+                    break;
+            }
 
-            case LooperState::STOPPED:
-                r = 0; g = 0; b = 1; // Solid BLUE
-                break;
+            setLedColor(r, g, b);
         }
 
-        setLedColor(r, g, b);
+        // Update Overload (Clip) and Audio Signal LEDs
+        if (clip_leds_active) {
+            int clip_val = status.in_clipped ? 1 : 0;
+            int sig_val = (status.in_peak > 0.02f) ? 1 : 0;
+
+            if (clip_val != current_clip_r) {
+                gpiod_line_set_value(clip_led_r, clip_val);
+                current_clip_r = clip_val;
+            }
+            if (sig_val != current_clip_g) {
+                gpiod_line_set_value(clip_led_g, sig_val);
+                current_clip_g = sig_val;
+            }
+        }
     }
 
     void buttonLoop() {
@@ -272,6 +333,7 @@ struct GpioManager::Impl {
     void stop() {}
     void updateStatus(const LooperStatus&) {}
     void setLedColor(int, int, int) {}
+    void setOff() {}
 };
 
 #endif // LOOPER_HAS_GPIOD
@@ -306,7 +368,7 @@ void GpioManager::updateStatus(const LooperStatus& status) {
 
 void GpioManager::setOff() {
     if (impl_) {
-        impl_->setLedColor(0, 0, 0);
+        impl_->setOff();
     }
 }
 
